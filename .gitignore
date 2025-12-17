@@ -1,0 +1,24 @@
+# Blender backup files
+*.blend1
+*.blend2
+
+# Blender cache directories
+blendcache_*/
+__pycache__/
+
+# Blender temporary files
+*.blend.lock
+*.py.lock
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Renders (optional - comment out if you want to track renders)
+# *.png
+# *.jpg
+# *.exr
