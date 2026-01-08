@@ -291,10 +291,179 @@ x,y,z,scale
 
 ---
 
+## CURRENT GOAL: BARNES-HUT GRAVITY SIMULATION (Goal 3)
+
+### Objective
+Add gravitational attraction between particles using the Barnes-Hut algorithm. Create "Molecular Plus Plus" - a modified version of Molecular Plus with N-body gravity simulation for galaxy/planetary simulations.
+
+### User Requirements (Exact Quotes)
+> "I'd like you to create a modified version of Molecular Plus, which we'll call Molecular Plus Plus. Where we add in a gravity simulation, meaning that I can disable gravity in Blender and simulate each of these particles as a star or a planet or some planetary body that are attracted to each other."
+>
+> "This should be a new tab in the Molecular add-on... We should add one for Gravity, which is disabled by default, but can be enabled just like the normal collisions can be."
+>
+> "Let's go with the fancy algorithm [Barnes-Hut]... implement this other gravity simulation feature on the latest version of molecular plus."
+>
+> "Don't create billions of new files, keep your changes to an absolute minimum."
+
+### Why Barnes-Hut (Not Brute Force or KNN)
+- **Brute force**: O(n²) - too slow for >1000 particles
+- **KNN (K-nearest)**: Ignores distant particles completely - physically wrong
+- **Barnes-Hut**: O(n log n) - treats distant particle groups as single point masses at their center of mass. Physically accurate approximation.
+
+### Algorithm Overview
+1. Build **octree** of all particles each frame
+2. For each node, precompute **total mass** and **center of mass**
+3. For each particle, traverse tree:
+   - If `node_size / distance < θ` (opening angle): treat node as single mass
+   - Otherwise: recurse into children
+4. Apply gravitational force: `F = G × m1 × M_node / r²`
+
+### Implementation Plan (Minimal Changes)
+| File | Change |
+|------|--------|
+| `structures.pyx` | Add `Octree` and `OctreeNode` structs ✅ DONE |
+| `simulate.pyx` | Add Barnes-Hut functions and gravity step |
+| `init.pyx` | Unpack gravity parameters |
+| `simulate.py` | Pass gravity settings to core |
+| `properties.py` | Add gravity properties (`mol_gravity_active`, etc.) |
+| `ui.py` | Add "Gravity" UI section |
+
+### Key Discovery: Particle Mass Already Exists
+The `Particle` struct already has a `mass` field (structures.pyx:107). The "Calculate Particle Weight by Density" feature uses this:
+
+```python
+# From simulate.py lines 116-125
+if psys.settings.mol_density_active:
+    par_mass = density × (4/3 × π × (size/2)³)  # Spherical volume × density
+else:
+    par_mass = psys.settings.mass  # Same mass for all
+```
+
+**Key insight**: Particles with different SIZES get different MASSES when density mode is enabled. This is perfect for galaxy simulations - larger stars = more mass = stronger gravity.
+
+### Status
+- [x] Examined particle data structures
+- [x] Understood simulation architecture
+- [x] Added `Octree` and `OctreeNode` structs to structures.pyx
+- [ ] Implement Barnes-Hut functions in simulate.pyx
+- [ ] Add gravity properties to properties.py
+- [ ] Add gravity UI section to ui.py
+- [ ] Update init.pyx to unpack gravity params
+- [ ] Update simulate.py to pass gravity params
+- [ ] Compile and test
+
+### CRITICAL TECHNICAL DETAILS (Preserve for Compaction)
+
+#### Data Flow: Blender → Cython
+1. `simulate.py:pack_data()` collects Blender particle data into arrays
+2. Creates `params` list (currently 50 elements, indices 0-49)
+3. Passes to `core.init(importdata)` on first frame
+4. Passes to `core.simulate(importdata)` each subsequent frame
+
+#### params Array Structure (simulate.py lines 175-226)
+```
+params[0] = mol_selfcollision_active
+params[1] = mol_othercollision_active
+params[2] = mol_collision_group
+params[3] = mol_friction
+params[4] = mol_collision_damp
+params[5] = mol_links_active
+... (up to index 49)
+params[48] = mol_collision_adhesion_search_distance
+params[49] = mol_collision_adhesion_factor
+# ADD GRAVITY AT: params[50], params[51], params[52]
+```
+
+#### Simulation Loop (simulate.pyx:simulate())
+```
+1. update(importdata)           # Updates particle state from Blender
+2. Copy particles to parlistcopy
+3. SpatialHash_build()          # For collision detection
+4. SpatialHash_query_neighbors() # Find nearby particles (parallel)
+5. collide() + solve_link()     # Per-particle physics
+6. Export data back to Blender
+```
+**INSERT GRAVITY AFTER step 4, BEFORE step 5**
+
+#### Key Global Variables (simulate.pyx)
+```cython
+cdef Particle *parlist = NULL      # All particles
+cdef int parnum = 0                # Particle count
+cdef float deltatime = 0           # Time step
+cdef int cpunum = 0                # Thread count
+```
+
+#### Particle Struct (structures.pyx:102-121)
+```cython
+cdef struct Particle:
+    int id
+    float loc[3]      # Position
+    float vel[3]      # Velocity - MODIFY THIS FOR GRAVITY
+    float size
+    float mass        # ALREADY EXISTS - use for gravity!
+    int state
+    ...
+```
+
+#### Changes Made So Far
+1. **structures.pyx**: Added at end of file:
+   - `OctreeNode` struct (center, half_size, mass, com, children[8])
+   - `Octree` struct (root, node_pool, theta, G, softening)
+
+#### Files to Modify (In Order)
+1. `properties.py` - Add: `mol_gravity_active`, `mol_gravity_strength`, `mol_gravity_theta`, `mol_gravity_softening`
+2. `ui.py` - Add "Gravity" box section after "Collisions" section (around line 416)
+3. `simulate.py` - Add params[50-53] for gravity settings
+4. `init.pyx` - Unpack gravity params into global variables
+5. `simulate.pyx` - Add Barnes-Hut functions:
+   - `Octree_create()`, `Octree_destroy()`
+   - `Octree_insert_particle()`
+   - `Octree_compute_mass_distribution()`
+   - `Octree_calculate_force()`
+   - Call from within `simulate()` after neighbor query
+
+#### Barnes-Hut Algorithm Pseudocode
+```
+def apply_gravity():
+    # Build octree
+    octree = Octree_create(parnum)
+    for i in range(parnum):
+        Octree_insert_particle(octree, &parlist[i])
+    Octree_compute_mass_distribution(octree.root)
+
+    # Calculate forces (parallel)
+    for i in prange(parnum):
+        force = Octree_calculate_force(octree.root, &parlist[i], theta)
+        # F = ma, a = F/m, v += a*dt
+        parlist[i].vel[0] += force[0] / parlist[i].mass * deltatime
+        parlist[i].vel[1] += force[1] / parlist[i].mass * deltatime
+        parlist[i].vel[2] += force[2] / parlist[i].mass * deltatime
+
+    Octree_destroy(octree)
+```
+
+#### Opening Angle θ (theta)
+- `θ = node_size / distance_to_node`
+- If θ < threshold (0.5-1.0): treat node as single point mass
+- Smaller θ = more accurate but slower
+- θ = 0.5 is typical for galaxy simulations
+
+#### To Answer User's Question About Density
+YES, "Calculate Particle Weight by Density" gives different particles different masses based on their SIZE:
+```python
+mass = density × (4/3 × π × (radius)³)
+```
+Larger particles = larger volume = more mass. Perfect for galaxy simulations where star size correlates with mass.
+
+---
+
 ## NEXT STEPS
 
-With Molecular Plus compiled and working, potential next steps:
-1. **Understand the simulation pipeline**: Study how `init` and `simulate` are called from `operators.py`
-2. **Identify physics customization points**: Find where collision/force calculations happen in the .pyx files
-3. **Modify physics behavior**: Implement custom forces or collision behaviors
-4. **Test custom modifications**: Recompile and verify changes work
+After completing Barnes-Hut gravity:
+1. Test with simple 2-body system (verify orbital mechanics)
+2. Test with multi-body galaxy simulation
+3. Tune parameters (θ opening angle, G constant, softening)
+4. Consider adding:
+   - Velocity damping option
+   - Central mass attractor
+   - Visualization of gravitational field
