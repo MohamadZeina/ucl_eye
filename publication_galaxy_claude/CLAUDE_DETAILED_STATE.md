@@ -1,8 +1,8 @@
 # CLAUDE_DETAILED_STATE.md
 
-Blender particle position control via Python. Successfully implemented frame handler approach to set particle positions and sizes from CSV coordinates. Also compiled Molecular Plus Cython core from source for custom physics modifications.
+Blender particle position control via Python. Successfully implemented frame handler approach to set particle positions and sizes from CSV coordinates. Also compiled Molecular Plus Cython core from source for custom physics modifications. Added TSNE computation pipeline for UCL scientific literature embeddings (370K papers) with 2D/3D coordinates and field hierarchy extraction.
 
-**Last updated**: 2026-01-08
+**Last updated**: 2026-01-09
 
 ---
 
@@ -31,6 +31,11 @@ Programmatically set Blender particle positions from CSV without using mesh vert
 Compile the Molecular Plus Cython (.pyx) files to enable custom physics modifications.
 
 **Status**: SOLVED. Successfully compiled and installed. Addon loads in Blender 4.5.
+
+### Goal 3: TSNE Embeddings for Scientific Literature ✅ COMPLETE
+Compute TSNE dimensionality reduction for UCL scientific paper embeddings with robust metadata mapping.
+
+**Status**: SOLVED. Generated 2D and 3D TSNE for 8K, 64K, and full 370K paper datasets with field hierarchy.
 
 ---
 
@@ -454,6 +459,63 @@ YES, "Calculate Particle Weight by Density" gives different particles different 
 mass = density × (4/3 × π × (radius)³)
 ```
 Larger particles = larger volume = more mass. Perfect for galaxy simulations where star size correlates with mass.
+
+---
+
+## COMPLETED: TSNE SCIENTIFIC LITERATURE EMBEDDINGS
+
+### The Task
+Compute TSNE dimensionality reduction for ~370K UCL scientific paper abstracts, with robust mapping to metadata including research field hierarchy.
+
+### Data Sources
+- **Embeddings**: BAAI-bge-large-en embeddings (1024 dims) for 418.9K paper title+abstracts
+- **Metadata**: OpenAlex data with DOIs, citations, publication year, concepts (field hierarchy)
+- **Location**: `/mnt/wwn-0x5000c500d577b928/mo_data/datasets/`
+
+### Generated Outputs
+All saved to `/mnt/wwn-0x5000c500d577b928/mo_data/models_etc/tsne/`:
+
+| Dataset | Dims | Papers | File |
+|---------|------|--------|------|
+| 8K | 2D | 8,000 | `ucl_papers_tsne_mapping_8K.csv` |
+| 64K | 2D | 64,000 | `ucl_papers_tsne_mapping_64K.csv` |
+| Full | 2D | 369,766 | `ucl_papers_tsne_mapping.csv` |
+| 8K | 3D | 8,000 | `ucl_papers_tsne_mapping_8K_3D.csv` |
+| 64K | 3D | 64,000 | `ucl_papers_tsne_mapping_64K_3D.csv` |
+| Full | 3D | 369,766 | `ucl_papers_tsne_mapping_full_3D.csv` |
+
+### CSV Columns
+- `cleaned_title` - Paper title
+- `decoded_abstract` - Full abstract text
+- `tsne_x`, `tsne_y`, `tsne_z` (3D only) - TSNE coordinates
+- `raw_doi`, `doi` - DOI identifiers
+- `publication_year` - Year published
+- `cited_by_count`, `citations_per_year` - Citation metrics
+- `field_level_0` - Broadest field (e.g., "Medicine", "Computer Science")
+- `field_level_1` - Sub-field
+- `field_level_2` - Specific area
+- `type`, `language`
+
+### Code Architecture
+
+**`tsne_module.py`** - Reusable module with functions:
+- `load_tsne_data(n_samples=None)` - Load pre-computed TSNE from CSV
+- `visualize_tsne(df, color_by=..., ...)` - Scatter plot visualization
+- `visualize_tsne_heatmap(df, ...)` - Density heatmap
+- `compute_tsne_from_embeddings(...)` - Generate new TSNE
+- `extract_field_from_concepts(concepts, level)` - Extract field hierarchy
+- `save_tsne_results(...)` - Save with metadata
+
+**`compute_tsne.py`** - Script using the module (with `# %%` cell markers for interactive use)
+
+### TSNE Parameters Used
+- Perplexity: 40
+- Iterations: 1000
+- PCA pre-reduction: 1024 → 50 dimensions (faster, similar results)
+- Random state: 42 (reproducible)
+
+### Key Insight from Original Notebook
+The original `tsne.ipynb` had a bug where `duplicate_indices` computed from one embedding file were incorrectly applied to TSNE results from a different embedding file. This caused ~49K row misalignment. The new pipeline properly deduplicates and maintains alignment throughout.
 
 ---
 
