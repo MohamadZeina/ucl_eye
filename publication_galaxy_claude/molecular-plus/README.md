@@ -29,6 +29,23 @@ A fork of [u3dreal/molecular-plus](https://github.com/u3dreal/molecular-plus) wi
 
 ---
 
+## Tested Versions
+
+This fork has been tested and confirmed working with:
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| **Blender** | 4.5 | Required (uses Python 3.11 internally) |
+| **Python** | 3.11.x | Must match Blender's embedded Python |
+| **Cython** | 3.0+ | For compiling the core module |
+| **macOS** | 15.x (Sequoia) | Apple Silicon (ARM64) |
+| **Windows** | 10/11 | x64, with VS Build Tools 2022 |
+| **Visual Studio Build Tools** | 2022 | Windows only, "Desktop C++" workload |
+
+> **Important:** The compiled `.so`/`.pyd` file is tied to the exact Python version. If Blender updates to Python 3.12, you must recompile with Python 3.12.
+
+---
+
 ## Compilation Instructions (macOS ARM64 / Apple Silicon)
 
 ### Prerequisites
