@@ -1,0 +1,2229 @@
+#cython: profile=False
+#cython: boundscheck=False
+#cython: wraparound=False
+#cython: cdivision=True
+#cython: language_level=3
+#cython: cpow=True
+
+# NOTE: order of slow functions to be optimize/multithreaded:
+# spatial_hash_building, spatial_hash_querying, linksolving
+
+
+cimport cython
+from time import process_time as clock
+from cython.parallel import parallel, prange, threadid
+from libc.stdlib cimport malloc, realloc, free, rand, srand, abs
+from libc.string cimport memcpy
+from libc.math cimport sqrt, pow
+
+#cdef extern from "omp.h":
+#    void omp_set_max_active_levels(int max_levels)
+
+#def set_max_active_levels(int max_levels):
+#    omp_set_max_active_levels(max_levels)
+
+#set_max_active_levels(1)
+
+cdef extern from "limits.h":
+    int INT_MAX
+
+cdef extern from "float.h":
+    float FLT_MAX
+
+
+cdef extern from "stdlib.h":
+    ctypedef void const_void "const void"
+    void qsort(
+        void *base,
+        int nmemb,
+        int size,
+        int(*compar)(const_void *, const_void *)
+    )noexcept nogil
+
+
+cdef float fps = 0
+cdef int substep = 0
+cdef float deltatime = 0
+cdef int parnum = 0
+cdef int psysnum = 0
+cdef int cpunum = 0
+cdef int newlinks = 0
+cdef int totallinks = 0
+cdef int totaldeadlinks = 0
+cdef int *deadlinks = NULL
+cdef Particle *parlist = NULL
+cdef SParticle *parlistcopy = NULL
+cdef ParSys *psys = NULL
+cdef SpatialHash *spatialhash = NULL
+
+# Barnes-Hut gravity globals
+cdef int gravity_enabled = 0
+cdef float gravity_G = 1.0
+cdef float gravity_theta = 0.5
+cdef float gravity_softening = 0.01
+
+# Initial rotation (applied ONCE on first frame, after gravity)
+cdef int initial_rotation_applied = 0
+cdef float initial_rotation_strength = 0.0
+cdef float initial_rotation_falloff = 0.5  # 0=flat, 0.5=Keplerian
+
+# Track if simulation has started (to prevent Blender from overwriting our velocities)
+cdef int simulation_started = 0
+
+print("cmolcore imported  v1.21.20+enclosed_mass_safe")
+
+
+# ============================================================================
+# Barnes-Hut N-body Gravity Implementation
+# ============================================================================
+
+cdef inline int get_octant(float px, float py, float pz,
+                           float cx, float cy, float cz) noexcept nogil:
+    """Get octant index for a point relative to center"""
+    cdef int octant = 0
+    if px >= cx: octant |= 1
+    if py >= cy: octant |= 2
+    if pz >= cz: octant |= 4
+    return octant
+
+
+cdef inline OctreeNode* allocate_node(Octree *tree) noexcept nogil:
+    """Allocate a node from the pre-allocated pool"""
+    if tree.next_free >= tree.pool_size:
+        return NULL
+    cdef OctreeNode *node = &tree.node_pool[tree.next_free]
+    tree.next_free += 1
+    node.is_leaf = 1
+    node.particle_id = -1
+    node.num_particles = 0
+    node.mass = 0.0
+    node.com[0] = 0.0
+    node.com[1] = 0.0
+    node.com[2] = 0.0
+    cdef int j
+    for j in range(8):
+        node.children[j] = NULL
+    return node
+
+
+cdef Octree* Octree_create(int max_particles, float theta, float G, float softening) noexcept nogil:
+    """Create octree with pre-allocated node pool"""
+    cdef Octree *tree = <Octree *>malloc(cython.sizeof(Octree))
+    # Allocate ~2x particles for internal nodes
+    tree.pool_size = max_particles * 2
+    tree.node_pool = <OctreeNode *>malloc(tree.pool_size * cython.sizeof(OctreeNode))
+    tree.next_free = 0
+    tree.root = NULL
+    tree.theta = theta
+    tree.G = G
+    tree.softening = softening
+    return tree
+
+
+cdef void Octree_destroy(Octree *tree) noexcept nogil:
+    """Free octree memory"""
+    if tree != NULL:
+        if tree.node_pool != NULL:
+            free(tree.node_pool)
+        free(tree)
+
+
+cdef void Octree_insert(Octree *tree, OctreeNode *node, Particle *par,
+                        float cx, float cy, float cz, float half_size, int depth) noexcept nogil:
+    """Insert particle into octree, building structure as needed"""
+    if node == NULL or depth > 50:  # Depth limit to prevent infinite recursion
+        return
+
+    cdef int octant
+    cdef float new_half = half_size * 0.5
+    cdef float new_cx, new_cy, new_cz
+    cdef Particle *existing
+
+    # Update center of mass incrementally
+    cdef float total_mass = node.mass + par.mass
+    if total_mass > 0:
+        node.com[0] = (node.com[0] * node.mass + par.loc[0] * par.mass) / total_mass
+        node.com[1] = (node.com[1] * node.mass + par.loc[1] * par.mass) / total_mass
+        node.com[2] = (node.com[2] * node.mass + par.loc[2] * par.mass) / total_mass
+    node.mass = total_mass
+    node.num_particles += 1
+
+    # If leaf with no particle yet, just store this particle
+    if node.is_leaf and node.particle_id == -1:
+        node.particle_id = par.id
+        return
+
+    # If leaf with existing particle, subdivide and re-insert both
+    if node.is_leaf and node.particle_id != -1:
+        node.is_leaf = 0
+        # Re-insert existing particle into appropriate child
+        existing = &parlist[node.particle_id]
+        octant = get_octant(existing.loc[0], existing.loc[1], existing.loc[2], cx, cy, cz)
+        if node.children[octant] == NULL:
+            node.children[octant] = allocate_node(tree)
+            if node.children[octant] == NULL:
+                return  # Pool exhausted
+            new_cx = cx + (new_half if (octant & 1) else -new_half)
+            new_cy = cy + (new_half if (octant & 2) else -new_half)
+            new_cz = cz + (new_half if (octant & 4) else -new_half)
+            node.children[octant].center[0] = new_cx
+            node.children[octant].center[1] = new_cy
+            node.children[octant].center[2] = new_cz
+            node.children[octant].half_size = new_half
+        Octree_insert(tree, node.children[octant], existing,
+                      node.children[octant].center[0],
+                      node.children[octant].center[1],
+                      node.children[octant].center[2], new_half, depth + 1)
+        node.particle_id = -1
+
+    # Insert new particle into appropriate child
+    octant = get_octant(par.loc[0], par.loc[1], par.loc[2], cx, cy, cz)
+    if node.children[octant] == NULL:
+        node.children[octant] = allocate_node(tree)
+        if node.children[octant] == NULL:
+            return  # Pool exhausted
+        new_cx = cx + (new_half if (octant & 1) else -new_half)
+        new_cy = cy + (new_half if (octant & 2) else -new_half)
+        new_cz = cz + (new_half if (octant & 4) else -new_half)
+        node.children[octant].center[0] = new_cx
+        node.children[octant].center[1] = new_cy
+        node.children[octant].center[2] = new_cz
+        node.children[octant].half_size = new_half
+    Octree_insert(tree, node.children[octant], par,
+                  node.children[octant].center[0],
+                  node.children[octant].center[1],
+                  node.children[octant].center[2], new_half, depth + 1)
+
+
+cdef void Octree_calculate_force(Octree *tree, OctreeNode *node, Particle *par,
+                                 float *force) noexcept nogil:
+    """Calculate gravitational force on particle from node (recursive Barnes-Hut)"""
+    if node == NULL or node.num_particles == 0:
+        return
+
+    # Skip self (when leaf contains this particle)
+    if node.is_leaf and node.particle_id == par.id:
+        return
+
+    cdef float dx = node.com[0] - par.loc[0]
+    cdef float dy = node.com[1] - par.loc[1]
+    cdef float dz = node.com[2] - par.loc[2]
+    cdef float dist_sq = dx*dx + dy*dy + dz*dz + tree.softening * tree.softening
+    cdef float dist = sqrt(dist_sq)
+    cdef float size = node.half_size * 2.0
+    cdef float force_mag
+    cdef int j
+
+    # Barnes-Hut criterion: if node is far enough, treat as single point mass
+    if node.is_leaf or (size / dist) < tree.theta:
+        # Compute acceleration: a = G * M / r^2 in direction of r
+        force_mag = tree.G * node.mass / dist_sq
+        force[0] += force_mag * dx / dist
+        force[1] += force_mag * dy / dist
+        force[2] += force_mag * dz / dist
+    else:
+        # Node is too close, recurse into children
+        for j in range(8):
+            if node.children[j] != NULL:
+                Octree_calculate_force(tree, node.children[j], par, force)
+
+
+cdef void apply_barnes_hut_gravity(int num_threads) noexcept nogil:
+    """Apply gravitational forces using Barnes-Hut algorithm with parallel force computation"""
+    global parlist, parnum, deltatime, gravity_G, gravity_theta, gravity_softening
+
+    cdef int i, j
+    cdef float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX
+    cdef float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX
+    cdef float cx, cy, cz, half_size
+    cdef Octree *octree
+    cdef float force[3]
+
+    # Find bounding box of all particles
+    for i in range(parnum):
+        if parlist[i].state >= 3:  # Only alive particles
+            if parlist[i].loc[0] < minX: minX = parlist[i].loc[0]
+            if parlist[i].loc[0] > maxX: maxX = parlist[i].loc[0]
+            if parlist[i].loc[1] < minY: minY = parlist[i].loc[1]
+            if parlist[i].loc[1] > maxY: maxY = parlist[i].loc[1]
+            if parlist[i].loc[2] < minZ: minZ = parlist[i].loc[2]
+            if parlist[i].loc[2] > maxZ: maxZ = parlist[i].loc[2]
+
+    # Compute center and half-size with small margin
+    cx = (minX + maxX) * 0.5
+    cy = (minY + maxY) * 0.5
+    cz = (minZ + maxZ) * 0.5
+    half_size = (maxX - minX)
+    if (maxY - minY) > half_size:
+        half_size = (maxY - minY)
+    if (maxZ - minZ) > half_size:
+        half_size = (maxZ - minZ)
+    half_size = half_size * 0.5 + 1.0  # Add margin
+
+    # Create octree
+    octree = Octree_create(parnum, gravity_theta, gravity_G, gravity_softening)
+    if octree == NULL:
+        return
+    octree.root = allocate_node(octree)
+    if octree.root == NULL:
+        Octree_destroy(octree)
+        return
+    octree.root.center[0] = cx
+    octree.root.center[1] = cy
+    octree.root.center[2] = cz
+    octree.root.half_size = half_size
+
+    # Insert all alive particles into octree (serial - modifies shared structure)
+    for i in range(parnum):
+        if parlist[i].state >= 3 and parlist[i].mass > 0:
+            Octree_insert(octree, octree.root, &parlist[i], cx, cy, cz, half_size, 0)
+
+    # Calculate forces and update velocities (PARALLEL - each particle independent)
+    for i in prange(parnum, schedule='dynamic', chunksize=64, num_threads=num_threads):
+        if parlist[i].state >= 3:
+            force[0] = 0.0
+            force[1] = 0.0
+            force[2] = 0.0
+            Octree_calculate_force(octree, octree.root, &parlist[i], force)
+            # Update velocity: v += a * dt
+            parlist[i].vel[0] = parlist[i].vel[0] + force[0] * deltatime
+            parlist[i].vel[1] = parlist[i].vel[1] + force[1] * deltatime
+            parlist[i].vel[2] = parlist[i].vel[2] + force[2] * deltatime
+
+    # Cleanup
+    Octree_destroy(octree)
+
+
+cdef void apply_initial_rotation_once(int num_threads) noexcept:
+    """Apply initial tangential velocity ONCE (first frame only).
+
+    Uses ENCLOSED MASS with CORE SOFTENING:
+    v = strength * sqrt(G * M_enclosed / r_effective)
+    r_effective = sqrt(r^2 + r_core^2)
+    r_core = falloff * r_max
+
+    Falloff parameter controls core softening:
+    - falloff = 0: no core (can be fast at center)
+    - falloff = 0.1-0.3: gentle core protection
+    - falloff = 0.5: large core, flatter profile
+    """
+    global parlist, parnum, gravity_G, initial_rotation_strength, initial_rotation_falloff, initial_rotation_applied
+
+    cdef int i
+    cdef int j
+    cdef float px, py, r_xy, inv_r
+    cdef float r_j
+    cdef float v_tangent
+    cdef float tangent_dir_x, tangent_dir_y
+    cdef int count = 0
+    cdef float r_max = 0.0
+    cdef float r_core = 0.0
+    cdef float r_effective = 0.0
+    cdef float enclosed_mass = 0.0
+    cdef float min_v = 999999.0
+    cdef float max_v = 0.0
+
+    # First pass: find maximum radius
+    for i in range(parnum):
+        if parlist[i].mass > 0:
+            r_xy = sqrt(parlist[i].loc[0] * parlist[i].loc[0] +
+                       parlist[i].loc[1] * parlist[i].loc[1])
+            if r_xy > r_max:
+                r_max = r_xy
+
+    if r_max < 0.001:
+        r_max = 1.0
+
+    # Core radius for softening
+    r_core = initial_rotation_falloff * r_max
+
+    print(f"  Rotation: strength={initial_rotation_strength:.4f}, core={r_core:.4f}, r_max={r_max:.4f}, G={gravity_G:.6f}")
+
+    # For each particle, calculate enclosed mass and velocity
+    for i in range(parnum):
+        if parlist[i].mass <= 0:
+            continue
+
+        px = parlist[i].loc[0]
+        py = parlist[i].loc[1]
+        r_xy = sqrt(px * px + py * py)
+
+        if r_xy < 0.001:
+            continue
+
+        # Calculate enclosed mass (mass of particles closer to center than this one)
+        enclosed_mass = 0.0
+        for j in range(parnum):
+            if parlist[j].mass > 0:
+                r_j = sqrt(parlist[j].loc[0] * parlist[j].loc[0] +
+                          parlist[j].loc[1] * parlist[j].loc[1])
+                if r_j <= r_xy:
+                    enclosed_mass = enclosed_mass + parlist[j].mass
+
+        if enclosed_mass <= 0.0:
+            continue
+
+        # Softened effective radius
+        r_effective = sqrt(r_xy * r_xy + r_core * r_core)
+
+        inv_r = 1.0 / r_xy
+
+        # Tangent direction (counter-clockwise, normalized)
+        tangent_dir_x = -py * inv_r
+        tangent_dir_y = px * inv_r
+
+        # Enclosed mass orbital velocity with core softening
+        v_tangent = initial_rotation_strength * sqrt(gravity_G * enclosed_mass / r_effective)
+
+        if v_tangent < min_v:
+            min_v = v_tangent
+        if v_tangent > max_v:
+            max_v = v_tangent
+
+        count = count + 1
+
+        # ADD tangential velocity
+        parlist[i].vel[0] = parlist[i].vel[0] + tangent_dir_x * v_tangent
+        parlist[i].vel[1] = parlist[i].vel[1] + tangent_dir_y * v_tangent
+
+    print(f"  Rotation applied to {count} particles, v range: {min_v:.4f} to {max_v:.4f}")
+
+    # Mark as applied so we don't do it again
+    initial_rotation_applied = 1
+
+
+cpdef simulate(importdata):
+    global spatialhash
+    global parlist
+    global parlistcopy
+    global parnum
+    global psysnum
+    global psys
+    global cpunum
+    global deltatime
+    global newlinks
+    global totallinks
+    global totaldeadlinks
+    global deadlinks
+    global gravity_enabled
+    global initial_rotation_frames_remaining
+    global simulation_started
+
+    cdef int i = 0
+    cdef int ii = 0
+    cdef int profiling = 0
+    cdef float minX = INT_MAX
+    cdef float minY = INT_MAX
+    cdef float minZ = INT_MAX
+    cdef float maxX = -INT_MAX
+    cdef float maxY = -INT_MAX
+    cdef float maxZ = -INT_MAX
+    cdef float maxSize = -INT_MAX
+    cdef Pool *parPool = <Pool *>malloc(1 * cython.sizeof(Pool))
+    parPool.parity = <Parity *>malloc(2 * cython.sizeof(Parity))
+    parPool[0].axis = -1
+    parPool[0].offset = 0
+    parPool[0].max = 0
+    cdef float query_radius = 0
+
+    newlinks = 0
+    for i in range(cpunum):
+        deadlinks[i] = 0
+    if profiling == 1:
+        print("-->start simulate")
+        stime2 = clock()
+        stime = clock()
+
+    update(importdata)
+
+    if profiling == 1:
+        print("-->update time", clock() - stime, "sec")
+        stime = clock()
+
+    for i in range(parnum):
+        parlistcopy[i].id = parlist[i].id
+
+        parlistcopy[i].loc[0] = parlist[i].loc[0]
+        if parlist[i].loc[0] < minX:
+            minX = parlist[i].loc[0]
+        if parlist[i].loc[0] > maxX:
+            maxX = parlist[i].loc[0]
+
+        parlistcopy[i].loc[1] = parlist[i].loc[1]
+        if parlist[i].loc[1] < minY:
+            minY = parlist[i].loc[1]
+        if parlist[i].loc[1] > maxY:
+            maxY = parlist[i].loc[1]
+
+        parlistcopy[i].loc[2] = parlist[i].loc[2]
+        if parlist[i].loc[2] < minZ:
+            minZ = parlist[i].loc[2]
+        if parlist[i].loc[2] > maxZ:
+            maxZ = parlist[i].loc[2]
+
+        if parlist[i].sys.links_active == 1:
+            if parlist[i].links_num > 0:
+                for ii in range(parlist[i].links_num):
+                    if parlist[i].links[ii].lenght > maxSize:
+                        maxSize = parlist[i].links[ii].lenght
+
+        if (parlist[i].size * 2) > maxSize:
+            maxSize = (parlist[i].size * 2)
+
+    if (maxX - minX) >= (maxY - minY) and (maxX - minX) >= (maxZ - minZ):
+        parPool[0].axis = 0
+        parPool[0].offset = 0 - minX
+        parPool[0].max = maxX + parPool[0].offset
+
+    if (maxY - minY) > (maxX - minX) and (maxY - minY) > (maxZ - minZ):
+        parPool[0].axis = 1
+        parPool[0].offset = 0 - minY
+        parPool[0].max = maxY + parPool[0].offset
+
+    if (maxZ - minZ) > (maxY - minY) and (maxZ - minZ) > (maxX - minX):
+        parPool[0].axis = 2
+        parPool[0].offset = 0 - minZ
+        parPool[0].max = maxZ + parPool[0].offset
+
+    if (parPool[0].max / ( cpunum * 10 )) > maxSize:
+        maxSize = (parPool[0].max / ( cpunum * 10 ))
+
+
+    cdef int pair
+    cdef int heaps
+    cdef float scale = 1 / ( maxSize * 2.1 )
+
+    for pair in range(2):
+
+        parPool[0].parity[pair].heap = \
+            <Heap *>malloc((<int>(parPool[0].max * scale) + 1) * \
+            cython.sizeof(Heap))
+
+        for heaps in range(<int>(parPool[0].max * scale) + 1):
+            parPool[0].parity[pair].heap[heaps].parnum = 0
+            parPool[0].parity[pair].heap[heaps].maxalloc = 50
+
+            parPool[0].parity[pair].heap[heaps].par = \
+                <int *>malloc(parPool[0].parity[pair].heap[heaps].maxalloc * \
+                cython.sizeof(int))
+
+    for i in range(parnum):
+        pair = <int>(((
+            parlist[i].loc[parPool[0].axis] + parPool[0].offset) * scale) % 2
+        )
+        heaps = <int>((
+            parlist[i].loc[parPool[0].axis] + parPool[0].offset) * scale
+        )
+        parPool[0].parity[pair].heap[heaps].parnum += 1
+
+        if parPool[0].parity[pair].heap[heaps].parnum > \
+                parPool[0].parity[pair].heap[heaps].maxalloc:
+
+            parPool[0].parity[pair].heap[heaps].maxalloc = \
+                <int>(parPool[0].parity[pair].heap[heaps].maxalloc * 1.25)
+
+            parPool[0].parity[pair].heap[heaps].par = \
+                <int *>realloc(
+                    parPool[0].parity[pair].heap[heaps].par,
+                    (parPool[0].parity[pair].heap[heaps].maxalloc + 2 ) * \
+                    cython.sizeof(int)
+                )
+
+        parPool[0].parity[pair].heap[heaps].par[
+            (parPool[0].parity[pair].heap[heaps].parnum - 1)] = parlist[i].id
+
+    if profiling == 1:
+        print("-->copy data time", clock() - stime, "sec")
+        stime = clock()
+
+    # Build spatial hash grid
+    SpatialHash_build(spatialhash, parlistcopy, parnum, maxSize)
+
+    if profiling == 1:
+        print("-->create spatial hash time", clock() - stime,"sec")
+        stime = clock()
+
+    # Query neighbors using spatial hash
+    with nogil:
+        for i in prange(
+                        parnum,
+                        schedule='dynamic',
+                        chunksize=2,
+                        num_threads=cpunum
+                        ):
+            query_radius = parlist[i].size * 2.0
+            if parlist[i].sys.collision_adhesion_factor > 0:
+                query_radius = max(query_radius,(parlist[i].size * 2) * (1.0 + parlist[i].sys.collision_adhesion_distance))
+            SpatialHash_query_neighbors(
+                spatialhash,
+                &parlist[i],
+                parlist,
+                query_radius
+            )
+
+    if profiling == 1:
+        print("-->neighbours time", clock() - stime, "sec")
+        stime = clock()
+
+    # Apply Barnes-Hut gravity if enabled
+    if gravity_enabled == 1:
+        with nogil:
+            apply_barnes_hut_gravity(cpunum)
+
+    # Apply initial rotation ONCE (first frame only), right after gravity
+    if gravity_enabled == 1 and initial_rotation_strength > 0 and initial_rotation_applied == 0:
+        apply_initial_rotation_once(cpunum)
+
+    if profiling == 1:
+        print("-->gravity time", clock() - stime, "sec")
+        stime = clock()
+
+    #cdef int total_heaps = <int>(parPool[0].max * scale) + 1
+    #cdef int total_pairs = 2
+
+    # Create a list of tasks
+    #tasks = [(pair, heaps, i) for pair in range(total_pairs) for heaps in range(total_heaps) for i in range(parPool[0].parity[pair].heap[heaps].parnum)]
+
+    #cdef int index
+    #for index in prange(len(tasks), nogil=True):
+    #    pair, heaps, i = tasks[index]
+    #    collide(&parlist[parPool[0].parity[pair].heap[heaps].par[i]])
+    #    solve_link(&parlist[parPool[0].parity[pair].heap[heaps].par[i]])
+
+    #    if parlist[parPool[0].parity[pair].heap[heaps].par[i]].neighboursnum > 1:
+    #        parlist[parPool[0].parity[pair].heap[heaps].par[i]].neighboursnum = 0
+
+    with nogil:
+        for pair in range(2):
+            for heaps in prange(
+                                <int>(parPool[0].max * scale) + 1,
+                                schedule='dynamic',
+                                chunksize=2,
+                                num_threads=cpunum
+                                ):
+                for i in range(parPool[0].parity[pair].heap[heaps].parnum):
+
+                    collide(
+                        &parlist[parPool[0].parity[pair].heap[heaps].par[i]]
+                    )
+
+                    solve_link(
+                        &parlist[parPool[0].parity[pair].heap[heaps].par[i]]
+                    )
+
+                    if parlist[
+                        parPool[0].parity[pair].heap[heaps].par[i]
+                    ].neighboursnum > 1:
+
+                       # free(parlist[i].neighbours)
+
+                        parlist[
+                            parPool[0].parity[pair].heap[heaps].par[i]
+                        ].neighboursnum = 0
+
+    if profiling == 1:
+        print("-->collide/solve link time", clock() - stime, "sec")
+        stime = clock()
+
+    # Position integration: x += v * dt
+    # This must be done AFTER all forces are applied to velocities
+    with nogil:
+        for i in prange(parnum, schedule='static', num_threads=cpunum):
+            if parlist[i].state >= 3:  # Only alive particles
+                parlist[i].loc[0] = parlist[i].loc[0] + parlist[i].vel[0] * deltatime
+                parlist[i].loc[1] = parlist[i].loc[1] + parlist[i].vel[1] * deltatime
+                parlist[i].loc[2] = parlist[i].loc[2] + parlist[i].vel[2] * deltatime
+
+    if profiling == 1:
+        print("-->position integration time", clock() - stime, "sec")
+        stime = clock()
+
+    exportdata = []
+    parloc = []
+    parvel = []
+    parloctmp = []
+    parveltmp = []
+
+    for i in range(psysnum):
+        for ii in range(psys[i].parnum):
+            parloctmp.append(psys[i].particles[ii].loc[0])
+            parloctmp.append(psys[i].particles[ii].loc[1])
+            parloctmp.append(psys[i].particles[ii].loc[2])
+            parveltmp.append(psys[i].particles[ii].vel[0])
+            parveltmp.append(psys[i].particles[ii].vel[1])
+            parveltmp.append(psys[i].particles[ii].vel[2])
+        parloc.append(parloctmp)
+        parvel.append(parveltmp)
+        parloctmp = []
+        parveltmp = []
+
+    totallinks += newlinks
+    pydeadlinks = 0
+    for i in range(cpunum):
+        pydeadlinks += deadlinks[i]
+    totaldeadlinks += pydeadlinks
+
+    exportdata = [
+        parloc,
+        parvel,
+        newlinks,
+        pydeadlinks,
+        totallinks,
+        totaldeadlinks
+    ]
+
+    for pair in range(2):
+        for heaps in range(<int>(parPool[0].max * scale) + 1):
+            parPool[0].parity[pair].heap[heaps].parnum = 0
+            free(parPool[0].parity[pair].heap[heaps].par)
+        free(parPool[0].parity[pair].heap)
+    free(parPool[0].parity)
+    free(parPool)
+
+    # Mark simulation as started so update() won't overwrite our velocities
+    simulation_started = 1
+
+    if profiling == 1:
+        print("-->export time", clock() - stime, "sec")
+        print("-->all process time", clock() - stime2, "sec")
+    return exportdata
+
+cdef void update(data):
+    global parlist
+    global parnum
+    global psysnum
+    global psys
+    global spatialhash
+    global simulation_started
+
+    cdef int i = 0
+    cdef int ii = 0
+
+    for i in range(psysnum):
+        psys[i].selfcollision_active = data[i][3]
+
+        for ii in range(psys[i].parnum):
+
+            # Only read positions from Blender on first frame
+            # After that, we maintain our own positions (CSV/simulated)
+            if simulation_started == 0:
+                psys[i].particles[ii].loc[0] = data[i][0][(ii * 3)]
+                psys[i].particles[ii].loc[1] = data[i][0][(ii * 3) + 1]
+                psys[i].particles[ii].loc[2] = data[i][0][(ii * 3) + 2]
+            # Only read velocities from Blender on first frame
+            # After that, we maintain our own velocities (Blender doesn't persist them)
+            if simulation_started == 0:
+                psys[i].particles[ii].vel[0] = data[i][1][(ii * 3)]
+                psys[i].particles[ii].vel[1] = data[i][1][(ii * 3) + 1]
+                psys[i].particles[ii].vel[2] = data[i][1][(ii * 3) + 2]
+
+            if psys[i].particles[ii].state == 3 and data[i][2][ii] == 3:
+                psys[i].particles[ii].state = data[i][2][ii] + 1
+                if psys[i].links_active == 1:
+                    if psys[i].link_rellength == 1:
+                        SpatialHash_query_neighbors(
+                            spatialhash,
+                            &psys[i].particles[ii],
+                            parlist,
+                            psys[i].particles[ii].size * psys[i].particles[ii].sys.link_length
+                        )
+                    else:
+                        SpatialHash_query_neighbors(
+                            spatialhash,
+                            &psys[i].particles[ii],
+                            parlist,
+                            psys[i].particles[ii].sys.link_length
+                        )
+                    create_link(psys[i].particles[ii].id, psys[i].link_max)
+                    # free(psys[i].particles[ii].neighbours)
+                    psys[i].particles[ii].neighboursnum = 0
+
+            elif psys[i].particles[ii].state == 4 and data[i][2][ii] == 3:
+                psys[i].particles[ii].state = 4
+
+            else:
+                psys[i].particles[ii].state = data[i][2][ii]
+
+            psys[i].particles[ii].collided_with = <int *>realloc(
+                psys[i].particles[ii].collided_with,
+                1 * cython.sizeof(int)
+            )
+            psys[i].particles[ii].collided_num = 0
+
+cpdef init(importdata):
+    global fps
+    global substep
+    global deltatime
+    global parnum
+    global parlist
+    global parlistcopy
+    global spatialhash
+    global psysnum
+    global psys
+    global cpunum
+    global newlinks
+    global totallinks
+    global totaldeadlinks
+    global deadlinks
+    global gravity_enabled
+    global gravity_G
+    global gravity_theta
+    global gravity_softening
+    global initial_rotation_applied
+    global initial_rotation_strength
+    global initial_rotation_falloff
+    global simulation_started
+    cdef int i = 0
+    cdef int ii = 0
+    cdef int profiling = 0
+
+    newlinks = 0
+    totallinks = 0
+    totaldeadlinks = 0
+    simulation_started = 0  # Temporarily 0 during init, set to 1 at end
+    fps = float(importdata[0][0])
+    substep = int(importdata[0][1])
+    deltatime = 1.0 / (fps * (substep + 1))
+    psysnum = importdata[0][2]
+    parnum = importdata[0][3]
+    cpunum = importdata[0][4]
+    deadlinks = <int *>malloc(cpunum * cython.sizeof(int))
+    print("  Number of cpu's used:", cpunum)
+    psys = <ParSys *>malloc(psysnum * cython.sizeof(ParSys))
+    parlist = <Particle *>malloc(parnum * cython.sizeof(Particle))
+    parlistcopy = <SParticle *>malloc(parnum * cython.sizeof(SParticle))
+    cdef int jj = 0
+
+    for i in range(psysnum):
+        psys[i].id = i
+        psys[i].parnum = importdata[i + 1][0]
+        psys[i].particles = <Particle *>malloc(psys[i].parnum * cython.sizeof(Particle))
+        psys[i].particles = &parlist[jj]
+        psys[i].selfcollision_active = importdata[i + 1][6][0]
+        psys[i].othercollision_active = importdata[i + 1][6][1]
+        psys[i].collision_group = importdata[i + 1][6][2]
+        psys[i].friction = importdata[i + 1][6][3]
+        psys[i].collision_damp = importdata[i + 1][6][4]
+        psys[i].links_active = importdata[i + 1][6][5]
+        psys[i].link_length = importdata[i + 1][6][6]
+        psys[i].link_max = importdata[i + 1][6][7]
+        psys[i].link_tension = importdata[i + 1][6][8]
+        psys[i].link_tensionrand = importdata[i + 1][6][9]
+        psys[i].link_stiff = importdata[i + 1][6][10] * 0.5
+        psys[i].link_stiffrand = importdata[i + 1][6][11]
+        psys[i].link_stiffexp = importdata[i + 1][6][12]
+        psys[i].link_damp = importdata[i + 1][6][13]
+        psys[i].link_damprand = importdata[i + 1][6][14]
+        psys[i].link_broken = importdata[i + 1][6][15]
+        psys[i].link_brokenrand = importdata[i + 1][6][16]
+        psys[i].link_estiff = importdata[i + 1][6][17] * 0.5
+        psys[i].link_estiffrand = importdata[i + 1][6][18]
+        psys[i].link_estiffexp = importdata[i + 1][6][19]
+        psys[i].link_edamp = importdata[i + 1][6][20]
+        psys[i].link_edamprand = importdata[i + 1][6][21]
+        psys[i].link_ebroken = importdata[i + 1][6][22]
+        psys[i].link_ebrokenrand = importdata[i + 1][6][23]
+        psys[i].relink_group = importdata[i + 1][6][24]
+        psys[i].relink_chance = importdata[i + 1][6][25]
+        psys[i].relink_chancerand = importdata[i + 1][6][26]
+        psys[i].relink_max = importdata[i + 1][6][27]
+        psys[i].relink_tension = importdata[i + 1][6][28]
+        psys[i].relink_tensionrand = importdata[i + 1][6][29]
+        psys[i].relink_stiff = importdata[i + 1][6][30] * 0.5
+        psys[i].relink_stiffexp = importdata[i + 1][6][31]
+        psys[i].relink_stiffrand = importdata[i + 1][6][32]
+        psys[i].relink_damp = importdata[i + 1][6][33]
+        psys[i].relink_damprand = importdata[i + 1][6][34]
+        psys[i].relink_broken = importdata[i + 1][6][35]
+        psys[i].relink_brokenrand = importdata[i + 1][6][36]
+        psys[i].relink_estiff = importdata[i + 1][6][37] * 0.5
+        psys[i].relink_estiffexp = importdata[i + 1][6][38]
+        psys[i].relink_estiffrand = importdata[i + 1][6][39]
+        psys[i].relink_edamp = importdata[i + 1][6][40]
+        psys[i].relink_edamprand = importdata[i + 1][6][41]
+        psys[i].relink_ebroken = importdata[i + 1][6][42]
+        psys[i].relink_ebrokenrand = importdata[i + 1][6][43]
+        psys[i].link_friction = importdata[i + 1][6][44]
+        psys[i].link_group = importdata[i + 1][6][45]
+        psys[i].other_link_active = importdata[i + 1][6][46]
+        psys[i].link_rellength = importdata[i + 1][6][47]
+        psys[i].collision_adhesion_distance = importdata[i + 1][6][48]
+        psys[i].collision_adhesion_factor = importdata[i + 1][6][49]
+        # Gravity (Barnes-Hut)
+        psys[i].gravity_active = importdata[i + 1][6][50]
+        psys[i].gravity_strength = importdata[i + 1][6][51]
+        psys[i].gravity_theta = importdata[i + 1][6][52]
+        psys[i].gravity_softening = importdata[i + 1][6][53]
+        psys[i].gravity_initial_rotation = importdata[i + 1][6][54]
+        psys[i].gravity_rotation_falloff = importdata[i + 1][6][55]
+
+        for ii in range(psys[i].parnum):
+            parlist[jj].id = jj
+            parlist[jj].loc[0] = importdata[i + 1][1][(ii * 3)]
+            parlist[jj].loc[1] = importdata[i + 1][1][(ii * 3) + 1]
+            parlist[jj].loc[2] = importdata[i + 1][1][(ii * 3) + 2]
+            parlist[jj].vel[0] = importdata[i + 1][2][(ii * 3)]
+            parlist[jj].vel[1] = importdata[i + 1][2][(ii * 3) + 1]
+            parlist[jj].vel[2] = importdata[i + 1][2][(ii * 3) + 2]
+            parlist[jj].size = importdata[i + 1][3][ii]
+            parlist[jj].mass = importdata[i + 1][4][ii]
+            parlist[jj].state = importdata[i + 1][5][ii]
+            parlist[jj].weak = importdata[i + 1][7][ii]
+            parlist[jj].sys = &psys[i]
+            parlist[jj].collided_with = <int *>malloc(1 * cython.sizeof(int))
+            parlist[jj].collided_num = 0
+            parlist[jj].links = <Links *>malloc(1 * cython.sizeof(Links))
+            parlist[jj].links_num = 0
+            parlist[jj].links_activnum = 0
+            parlist[jj].link_with = <int *>malloc(1 * cython.sizeof(int))
+            parlist[jj].link_withnum = 0
+            parlist[jj].neighboursmax = 10
+            parlist[jj].neighbours = <int *>malloc(parlist[jj].neighboursmax * cython.sizeof(int))
+            parlist[jj].neighboursnum = 0
+            jj += 1
+
+    jj = 0
+    spatialhash = <SpatialHash *>malloc(1 * cython.sizeof(SpatialHash))
+    SpatialHash_create(spatialhash, parnum * 2, cpunum)
+
+    with nogil:
+        for i in prange(
+                        parnum,
+                        schedule='dynamic',
+                        chunksize=2,
+                        num_threads=cpunum
+                        ):
+            parlistcopy[i].id = parlist[i].id
+            # parlistcopy[i].loc = parlist[i].loc
+
+            memcpy(parlistcopy[i].loc, parlist[i].loc, sizeof(parlist[i].loc))
+
+    # Calculate maximum search radius for initial spatial hash build
+    cdef float max_radius = 0
+    cdef float radius
+    for i in range(parnum):
+        if parlist[i].sys.links_active == 1:
+            if parlist[i].sys.link_rellength == 1:
+                radius = parlist[i].size * parlist[i].sys.link_length
+            else:
+                radius = parlist[i].sys.link_length
+        else:
+            radius = parlist[i].size * 2
+        if radius > max_radius:
+            max_radius = radius
+
+    SpatialHash_build(spatialhash, parlistcopy, parnum, max_radius)
+
+    with nogil:
+        for i in prange(
+                        parnum,
+                        schedule='dynamic',
+                        chunksize=2,
+                        num_threads=cpunum
+                        ):
+            if parlist[i].sys.links_active == 1:
+                if parlist[i].sys.link_rellength == 1:
+                    SpatialHash_query_neighbors(
+                        spatialhash,
+                        &parlist[i],
+                        parlist,
+                        parlist[i].size * parlist[i].sys.link_length
+                    )
+                else:
+                    SpatialHash_query_neighbors(
+                        spatialhash,
+                        &parlist[i],
+                        parlist,
+                        parlist[i].sys.link_length
+                    )
+
+    with nogil:
+        for i in prange(parnum):
+            create_link(parlist[i].id, parlist[i].sys.link_max)
+            if parlist[i].neighboursnum > 1:
+                # free(parlist[i].neighbours)
+                parlist[i].neighboursnum = 0
+
+    totallinks += newlinks
+    print("  New links created: ", newlinks)
+
+    # Initialize gravity globals from first system with gravity enabled
+    gravity_enabled = 0
+    gravity_G = 1.0
+    gravity_theta = 0.5
+    gravity_softening = 0.01
+    cdef float initial_rotation = 0.0
+    cdef float total_mass = 0.0
+    cdef float r_xy, v_circ, inv_r
+    cdef float px, py
+    cdef int applied_count = 0
+
+    for i in range(psysnum):
+        if psys[i].gravity_active == 1:
+            gravity_enabled = 1
+            gravity_G = psys[i].gravity_strength
+            gravity_theta = psys[i].gravity_theta
+            gravity_softening = psys[i].gravity_softening
+            initial_rotation = psys[i].gravity_initial_rotation
+            initial_rotation_falloff = psys[i].gravity_rotation_falloff
+            print("  Gravity enabled: G=", gravity_G, " theta=", gravity_theta, " softening=", gravity_softening)
+            break
+
+    # Set rotation parameters - applied ONCE on first frame, after gravity
+    initial_rotation_applied = 0  # Reset so it applies on first frame
+    initial_rotation_strength = 0.0
+    if initial_rotation != 0.0 and gravity_enabled == 1:
+        initial_rotation_strength = initial_rotation
+        print(f"  Rotation enabled: strength={initial_rotation}, falloff={initial_rotation_falloff}")
+
+    # Mark simulation as started so update() doesn't overwrite positions/velocities
+    # init() has already set them correctly from pack_data (including CSV if used)
+    simulation_started = 1
+
+    return parnum
+
+cdef void create_link(int par_id, int max_link, int parothers_id=-1)noexcept nogil:
+    global parlist
+    global parnum
+    global newlinks
+
+    cdef Links *link = <Links *>malloc(1 * cython.sizeof(Links))
+    cdef int *neighbours = NULL
+    cdef int ii = 0
+    cdef int neighboursnum = 0
+    cdef float rand_max = 32767
+    cdef float relinkrandom = 0
+    cdef Particle *par = NULL
+    cdef Particle *par2 = NULL
+    cdef float stiffrandom = 0
+    cdef float damprandom = 0
+    cdef float brokrandom = 0
+    cdef float tension = 0
+    cdef float tensionrandom = 0
+    cdef float chancerdom = 0
+    cdef Particle *fakepar = NULL
+    cdef int create_links
+    fakepar = <Particle *>malloc(1 * cython.sizeof(Particle))
+    par = &parlist[par_id]
+
+    if  par.state < 3:
+        return
+    if par.links_activnum >= max_link:
+        return
+    if par.sys.relink_chance == 0 and par.sys.links_active == 0:
+        return
+
+    if parothers_id == -1:
+        # SpatialHash_query_neighbors(spatialhash, &fakepar[0], par.loc, par.sys.link_length)
+        # neighbours = fakepar[0].neighbours
+        neighbours = par.neighbours
+        neighboursnum = par.neighboursnum
+    else:
+        neighbours = <int *>malloc(1 * cython.sizeof(int))
+        neighbours[0] = parothers_id
+        neighboursnum = 1
+
+    for ii in range(neighboursnum):
+        if par.links_activnum >= max_link:
+            break
+        if parothers_id == -1:
+            par2 = &parlist[neighbours[ii]]
+            tension = (par.sys.link_tension + par2.sys.link_tension) / 2
+        else:
+            par2 = &parlist[neighbours[0]]
+            tension = (par.sys.link_tension + par2.sys.link_tension) / 2
+        if par.id != par2.id:
+            # arraysearch(par2.id, par.link_with, par.link_withnum)
+
+            if arraysearch(par.id,par2.link_with,par2.link_withnum) == -1 and \
+                    par2.state >= 3 and par.state >= 3:
+
+            #if par not in par2.link_with and par2.state <= 1 \
+            #   and par.state <= 1:
+
+                link.start = par.id
+                link.end = par2.id
+
+                link.friction = (par.sys.link_friction + par2.sys.link_friction) / 2
+
+                if parothers_id == -1 and par.sys.link_group == par2.sys.link_group:
+                    if par.sys.id != par2.sys.id:
+                        if par.sys.other_link_active and par2.sys.other_link_active:
+                            create_links = 1
+                        else:
+                            create_links = 0
+                    else:
+                        create_links = 1
+
+                    if create_links == 1:
+                        tensionrandom = (par.sys.link_tensionrand + par2.sys.link_tensionrand) / 2 * 2
+                        srand(1)
+                        tension = ((par.sys.link_tension + par2.sys.link_tension)/2) * ((((rand() / rand_max) * tensionrandom) - (tensionrandom / 2)) + 1)
+                        srand(2)
+                        link.lenght = sqrt(optimized_square_dist_3d(par.loc,par2.loc)) * tension
+                        # link.lenght = ((square_dist(par.loc,par2.loc,3))**0.5) * tension
+                        stiffrandom = (par.sys.link_stiffrand + par2.sys.link_stiffrand) / 2 * 2
+                        link.stiffness = ((par.sys.link_stiff + par2.sys.link_stiff)/2) * ((((rand() / rand_max) * stiffrandom) - (stiffrandom / 2)) + 1)
+                        srand(3)
+                        link.estiffness = ((par.sys.link_estiff + par2.sys.link_estiff)/2) * ((((rand() / rand_max) * stiffrandom) - (stiffrandom / 2)) + 1)
+                        srand(4)
+                        link.exponent =  abs(int((par.sys.link_stiffexp + par2.sys.link_stiffexp) / 2))
+                        link.eexponent = abs(int((par.sys.link_estiffexp + par2.sys.link_estiffexp) / 2))
+                        damprandom = ((par.sys.link_damprand + par2.sys.link_damprand) / 2) * 2
+                        link.damping = ((par.sys.link_damp + par2.sys.link_damp) / 2) * ((((rand() / rand_max) * damprandom) - (damprandom / 2)) + 1)
+                        srand(5)
+                        link.edamping = ((par.sys.link_edamp + par2.sys.link_edamp) / 2) * ((((rand() / rand_max) * damprandom) - (damprandom / 2)) + 1)
+                        brokrandom = ((par.sys.link_brokenrand + par2.sys.link_brokenrand) / 2) * 2
+                        srand(6)
+                        #link.broken = ((par.sys.link_broken + par2.sys.link_broken) / 2) * ((((rand() / rand_max) * brokrandom) - (brokrandom  / 2)) + 1)
+                        link.broken = (par.weak * par2.weak) * (par.sys.link_broken * par2.sys.link_broken) * ((((rand() / rand_max) * brokrandom) - (brokrandom  / 2)) + 1)
+                        srand(7)
+                        link.ebroken = (par.weak * par2.weak) * (par.sys.link_ebroken * par2.sys.link_ebroken) * ((((rand() / rand_max) * brokrandom) - (brokrandom  / 2)) + 1)
+                        par.links[par.links_num] = link[0]
+                        par.links_num += 1
+                        par.links_activnum += 1
+                        par.links = <Links *>realloc(par.links,(par.links_num + 2) * cython.sizeof(Links))
+
+                        par.link_with[par.link_withnum] = par2.id
+                        par.link_withnum += 1
+
+                        par.link_with = <int *>realloc(par.link_with,(par.link_withnum + 2) * cython.sizeof(int))
+
+                        par2.link_with[par2.link_withnum] = par.id
+                        par2.link_withnum += 1
+
+                        par2.link_with = <int *>realloc(par2.link_with,(par2.link_withnum + 2) * cython.sizeof(int))
+                        newlinks += 1
+                        # free(link)
+
+                if parothers_id != -1 and par.sys.relink_group == par2.sys.relink_group:
+                    srand(8)
+                    relinkrandom = (rand() / rand_max)
+                    chancerdom = (par.sys.relink_chancerand + par2.sys.relink_chancerand) / 2 * 2
+                    srand(9)
+
+                    if relinkrandom <= ((par.sys.relink_chance + par2.sys.relink_chance) / 2) * ((((rand() / rand_max) * chancerdom) - (chancerdom / 2)) + 1):
+                        tensionrandom = (par.sys.relink_tensionrand + par2.sys.relink_tensionrand) / 2 * 2
+                        srand(10)
+                        tension = ((par.sys.relink_tension + par2.sys.relink_tension)/2) * ((((rand() / rand_max) * tensionrandom) - (tensionrandom / 2)) + 1)
+                        srand(11)
+                        link.lenght = sqrt(optimized_square_dist_3d(par.loc,par2.loc)) * tension
+                        # link.lenght = ((square_dist(par.loc,par2.loc,3))**0.5) * tension
+                        stiffrandom = (par.sys.relink_stiffrand + par2.sys.relink_stiffrand) / 2 * 2
+                        link.stiffness = ((par.sys.relink_stiff + par2.sys.relink_stiff)/2) * ((((rand() / rand_max) * stiffrandom) - (stiffrandom / 2)) + 1)
+                        srand(12)
+                        link.estiffness = ((par.sys.relink_estiff + par2.sys.relink_estiff)/2) * ((((rand() / rand_max) * stiffrandom) - (stiffrandom / 2)) + 1)
+                        srand(13)
+                        link.exponent = abs(int((par.sys.relink_stiffexp + par2.sys.relink_stiffexp) / 2))
+                        link.eexponent = abs(int((par.sys.relink_estiffexp + par2.sys.relink_estiffexp) / 2))
+                        damprandom = ((par.sys.relink_damprand + par2.sys.relink_damprand) / 2) * 2
+                        link.damping = ((par.sys.relink_damp + par2.sys.relink_damp) / 2) * ((((rand() / rand_max) * damprandom) - (damprandom / 2)) + 1)
+                        srand(14)
+                        link.edamping = ((par.sys.relink_edamp + par2.sys.relink_edamp) / 2) * ((((rand() / rand_max) * damprandom) - (damprandom / 2)) + 1)
+                        brokrandom = ((par.sys.relink_brokenrand + par2.sys.relink_brokenrand) / 2) * 2
+                        link.broken = ((par.sys.relink_broken + par2.sys.relink_broken) / 2) * ((((rand() / rand_max) * brokrandom) - (brokrandom  / 2)) + 1)
+                        srand(15)
+                        link.ebroken = ((par.sys.relink_ebroken + par2.sys.relink_ebroken) / 2) * ((((rand() / rand_max) * brokrandom) - (brokrandom  / 2)) + 1)
+                        par.links[par.links_num] = link[0]
+                        par.links_num += 1
+                        par.links_activnum += 1
+                        par.links = <Links *>realloc(par.links,(par.links_num + 1) * cython.sizeof(Links))
+                        par.link_with[par.link_withnum] = par2.id
+                        par.link_withnum += 1
+                        par.link_with = <int *>realloc(par.link_with,(par.link_withnum + 1) * cython.sizeof(int))
+                        par2.link_with[par2.link_withnum] = par.id
+                        par2.link_withnum += 1
+                        par2.link_with = <int *>realloc(par2.link_with,(par2.link_withnum + 1) * cython.sizeof(int))
+                        newlinks += 1
+                        # free(link)
+    #free(neighbours)
+    free(fakepar)
+    free(link)
+    #free(par)
+    #free(par2)
+
+
+cdef void solve_link(Particle *par)noexcept nogil:
+    global parlist
+    global deltatime
+    global deadlinks
+    cdef int i = 0
+    cdef float stiff = 0
+    cdef float damping = 0
+    cdef float timestep = 0
+    cdef float exp = 0
+    cdef Particle *par1 = NULL
+    cdef Particle *par2 = NULL
+    cdef float *Loc1 = [0, 0, 0]
+    cdef float *Loc2 = [0, 0, 0]
+    cdef float *V1 = [0, 0, 0]
+    cdef float *V2 = [0, 0, 0]
+    cdef float LengthX = 0
+    cdef float LengthY = 0
+    cdef float LengthZ = 0
+    cdef float Length = 0
+    cdef float Vx = 0
+    cdef float Vy = 0
+    cdef float Vz = 0
+    cdef float V = 0
+    cdef float ForceSpring = 0
+    cdef float ForceDamper = 0
+    cdef float ForceX = 0
+    cdef float ForceY = 0
+    cdef float ForceZ = 0
+    cdef float *Force1 = [0, 0, 0]
+    cdef float *Force2 = [0, 0, 0]
+    cdef float ratio1 = 0
+    cdef float ratio2 = 0
+    cdef int parsearch = 0
+    cdef int par2search = 0
+    cdef float *normal1 = [0, 0, 0]
+    cdef float *normal2 = [0, 0, 0]
+    cdef float factor1 = 0
+    cdef float factor2 = 0
+    cdef float friction1 = 0
+    cdef float friction2 = 0
+    cdef float *ypar1_vel = [0, 0, 0]
+    cdef float *xpar1_vel = [0, 0, 0]
+    cdef float *ypar2_vel = [0, 0, 0]
+    cdef float *xpar2_vel = [0, 0, 0]
+    # broken_links = []
+    if  par.state < 3:
+        return
+    for i in range(par.links_num):
+        if par.links[i].start != -1:
+            par1 = &parlist[par.links[i].start]
+            par2 = &parlist[par.links[i].end]
+            memcpy(Loc1, par1.loc, sizeof(par1.loc))
+            memcpy(Loc2, par2.loc, sizeof(par2.loc))
+            memcpy(V1, par1.vel, sizeof(par1.vel))
+            memcpy(V2, par2.vel, sizeof(par2.vel))
+            # Loc1[0] = par1.loc[0]
+            # Loc1[1] = par1.loc[1]
+            # Loc1[2] = par1.loc[2]
+            # Loc2[0] = par2.loc[0]
+            # Loc2[1] = par2.loc[1]
+            # Loc2[2] = par2.loc[2]
+            # V1[0] = par1.vel[0]
+            # V1[1] = par1.vel[1]
+            # V1[2] = par1.vel[2]
+            # V2[0] = par2.vel[0]
+            # V2[1] = par2.vel[1]
+            # V2[2] = par2.vel[2]
+            LengthX = Loc2[0] - Loc1[0]
+            LengthY = Loc2[1] - Loc1[1]
+            LengthZ = Loc2[2] - Loc1[2]
+            Length = sqrt(LengthX * LengthX + LengthY * LengthY + LengthZ * LengthZ)
+            # Length = (LengthX ** 2 + LengthY ** 2 + LengthZ ** 2) ** (0.5)
+            if par.links[i].lenght != Length and Length != 0:
+                if par.links[i].lenght > Length:
+                    stiff = par.links[i].stiffness / deltatime
+                    damping = par.links[i].damping
+                    exp = par.links[i].exponent
+                if par.links[i].lenght < Length:
+                    stiff = par.links[i].estiffness / deltatime
+                    damping = par.links[i].edamping
+                    exp = par.links[i].eexponent
+                Vx = V2[0] - V1[0]
+                Vy = V2[1] - V1[1]
+                Vz = V2[2] - V1[2]
+                V = (Vx * LengthX + Vy * LengthY + Vz * LengthZ) / Length
+                ForceSpring = ((Length - par.links[i].lenght) ** (exp)) * stiff
+                ForceDamper = damping * V
+                ForceSprDam = ForceSpring + ForceDamper
+                ForceX = ForceSprDam * LengthX / Length
+                ForceY = ForceSprDam * LengthY / Length
+                ForceZ = ForceSprDam * LengthZ / Length
+                Force1[0] = ForceX
+                Force1[1] = ForceY
+                Force1[2] = ForceZ
+                Force2[0] = -ForceX
+                Force2[1] = -ForceY
+                Force2[2] = -ForceZ
+                parSumMass = par1.mass + par2.mass
+                ratio1 = par2.mass / parSumMass
+                ratio2 = par1.mass / parSumMass
+
+                if par1.state == 1: #dead particle, correct velocity ratio of alive partner
+                    ratio1 = 0
+                    ratio2 = 1
+                elif par2.state == 1:
+                    ratio1 = 1
+                    ratio2 = 0
+
+                for j in range(3):
+                    par1.vel[j] += Force1[j] * ratio1
+                    par2.vel[j] += Force2[j] * ratio2
+                #par1.vel[0] += Force1[0] * ratio1
+                #par1.vel[1] += Force1[1] * ratio1
+                #par1.vel[2] += Force1[2] * ratio1
+                #par2.vel[0] += Force2[0] * ratio2
+                #par2.vel[1] += Force2[1] * ratio2
+                #par2.vel[2] += Force2[2] * ratio2
+
+                normal1[0] = LengthX / Length
+                normal1[1] = LengthY / Length
+                normal1[2] = LengthZ / Length
+                normal2[0] = normal1[0] * -1
+                normal2[1] = normal1[1] * -1
+                normal2[2] = normal1[2] * -1
+
+                factor1 = dot_product(par1.vel, normal1)
+                factor2 = dot_product(par2.vel, normal2)
+
+                for j in range(3):
+                    ypar1_vel[j] = factor1 * normal1[j]
+                    xpar1_vel[j] = par1.vel[j] - ypar1_vel[j]
+
+                    ypar2_vel[j] = factor2 * normal2[j]
+                    xpar2_vel[j] = par2.vel[j] - ypar2_vel[j]
+
+                #factor1 = dot_product(par1.vel, normal1)
+
+                #ypar1_vel[0] = factor1 * normal1[0]
+                #ypar1_vel[1] = factor1 * normal1[1]
+                #ypar1_vel[2] = factor1 * normal1[2]
+                #xpar1_vel[0] = par1.vel[0] - ypar1_vel[0]
+                #xpar1_vel[1] = par1.vel[1] - ypar1_vel[1]
+                #xpar1_vel[2] = par1.vel[2] - ypar1_vel[2]
+
+                #factor2 = dot_product(par2.vel, normal2)
+
+                #ypar2_vel[0] = factor2 * normal2[0]
+                #ypar2_vel[1] = factor2 * normal2[1]
+                #ypar2_vel[2] = factor2 * normal2[2]
+                #xpar2_vel[0] = par2.vel[0] - ypar2_vel[0]
+                #xpar2_vel[1] = par2.vel[1] - ypar2_vel[1]
+                #xpar2_vel[2] = par2.vel[2] - ypar2_vel[2]
+
+                friction1 = 1 - ((par.links[i].friction) * ratio1)
+                friction2 = 1 - ((par.links[i].friction) * ratio2)
+
+                for j in range(3):
+                    par1.vel[j] = ypar1_vel[j] + ((xpar1_vel[j] * friction1) + (xpar2_vel[j] * (1 - friction1)))
+                    par2.vel[j] = ypar2_vel[j] + ((xpar2_vel[j] * friction2) + (xpar1_vel[j] * (1 - friction2)))
+
+                #par1.vel[0] = ypar1_vel[0] + ((xpar1_vel[0] * friction1) + \
+                #    (xpar2_vel[0] * ( 1 - friction1)))
+
+                #par1.vel[1] = ypar1_vel[1] + ((xpar1_vel[1] * friction1) + \
+                #    (xpar2_vel[1] * ( 1 - friction1)))
+
+                #par1.vel[2] = ypar1_vel[2] + ((xpar1_vel[2] * friction1) + \
+                #    (xpar2_vel[2] * ( 1 - friction1)))
+
+                #par2.vel[0] = ypar2_vel[0] + ((xpar2_vel[0] * friction2) + \
+                #    (xpar1_vel[0] * ( 1 - friction2)))
+
+                #par2.vel[1] = ypar2_vel[1] + ((xpar2_vel[1] * friction2) + \
+                #    (xpar1_vel[1] * ( 1 - friction2)))
+
+                #par2.vel[2] = ypar2_vel[2] + ((xpar2_vel[2] * friction2) + \
+                #    (xpar1_vel[2] * ( 1 - friction2)))
+
+                if Length > (par.links[i].lenght * (1 + par.links[i].ebroken)) \
+                or Length < (par.links[i].lenght  * (1 - par.links[i].broken)):
+
+                    par.links[i].start = -1
+                    par.links_activnum -= 1
+                    deadlinks[threadid()] += 1
+
+                    parsearch = arraysearch(
+                        par2.id,
+                        par.link_with,
+                        par.link_withnum
+                    )
+
+                    if parsearch != -1:
+                        par.link_with[parsearch] = -1
+
+                    par2search = arraysearch(
+                        par.id,
+                        par2.link_with,
+                        par2.link_withnum
+                    )
+
+                    if par2search != -1:
+                        par2.link_with[par2search] = -1
+
+                    # broken_links.append(link)
+                    # if par2 in par1.link_with:
+                        # par1.link_with.remove(par2)
+                    # if par1 in par2.link_with:
+                        # par2.link_with.remove(par1)
+
+    # par.links = list(set(par.links) - set(broken_links))
+    # free(par1)
+    # free(par2)
+
+cimport cython
+from cython.parallel import parallel, prange
+from libc.stdlib cimport malloc, realloc, free, calloc
+from libc.math cimport floor, ceil, fabs
+
+
+
+
+cdef void SpatialHash_create(SpatialHash *hash, int max_particles, int num_threads) noexcept nogil:
+    """Initialize the spatial hash grid structure"""
+    hash.total_particles = 0
+    hash.num_threads = num_threads
+
+    # Pre-allocate main arrays
+    hash.particle_indices = <int *>malloc(max_particles * cython.sizeof(int))
+    hash.particle_cells = <int *>malloc(max_particles * cython.sizeof(int))
+
+    # Will be allocated once we know grid dimensions
+    hash.cell_counts = NULL
+    hash.cell_starts = NULL
+    hash.temp_counts = NULL
+
+    # Allocate thread-local arrays
+    hash.thread_cell_counts = <int **>malloc(num_threads * 8)  # sizeof(int *)
+    hash.thread_particle_indices = <int **>malloc(num_threads * 8)  # sizeof(int *)
+
+    cdef int i
+    for i in range(num_threads):
+        hash.thread_cell_counts[i] = NULL
+        hash.thread_particle_indices[i] = NULL
+
+
+cdef void SpatialHash_destroy(SpatialHash *hash) noexcept nogil:
+    """Free all allocated memory"""
+    cdef int i
+
+    if hash.particle_indices != NULL:
+        free(hash.particle_indices)
+    if hash.particle_cells != NULL:
+        free(hash.particle_cells)
+    if hash.cell_counts != NULL:
+        free(hash.cell_counts)
+    if hash.cell_starts != NULL:
+        free(hash.cell_starts)
+    if hash.temp_counts != NULL:
+        free(hash.temp_counts)
+
+    if hash.thread_cell_counts != NULL:
+        for i in range(hash.num_threads):
+            if hash.thread_cell_counts[i] != NULL:
+                free(hash.thread_cell_counts[i])
+            if hash.thread_particle_indices[i] != NULL:
+                free(hash.thread_particle_indices[i])
+        free(hash.thread_cell_counts)
+        free(hash.thread_particle_indices)
+
+
+cdef inline int SpatialHash_get_cell_index(SpatialHash *hash, float x, float y, float z) noexcept nogil:
+    """Convert 3D position to 1D cell index"""
+    cdef int cell_x = <int>floor((x - hash.min_bounds[0]) / hash.cell_size)
+    cdef int cell_y = <int>floor((y - hash.min_bounds[1]) / hash.cell_size)
+    cdef int cell_z = <int>floor((z - hash.min_bounds[2]) / hash.cell_size)
+
+    # Clamp to valid range
+    if cell_x < 0: cell_x = 0
+    elif cell_x >= hash.grid_width: cell_x = hash.grid_width - 1
+
+    if cell_y < 0: cell_y = 0
+    elif cell_y >= hash.grid_height: cell_y = hash.grid_height - 1
+
+    if cell_z < 0: cell_z = 0
+    elif cell_z >= hash.grid_depth: cell_z = hash.grid_depth - 1
+
+    return cell_x + cell_y * hash.grid_width + cell_z * hash.grid_width * hash.grid_height
+
+
+cdef void SpatialHash_calculate_bounds(SpatialHash *hash, SParticle *particles, int particle_count) noexcept nogil:
+    """Calculate bounding box and determine grid dimensions"""
+    if particle_count == 0:
+        return
+
+    # Initialize bounds with first particle
+    hash.min_bounds[0] = particles[0].loc[0]
+    hash.max_bounds[0] = particles[0].loc[0]
+    hash.min_bounds[1] = particles[0].loc[1]
+    hash.max_bounds[1] = particles[0].loc[1]
+    hash.min_bounds[2] = particles[0].loc[2]
+    hash.max_bounds[2] = particles[0].loc[2]
+
+    # Find actual bounds
+    cdef int i
+    for i in range(1, particle_count):
+        if particles[i].loc[0] < hash.min_bounds[0]:
+            hash.min_bounds[0] = particles[i].loc[0]
+        elif particles[i].loc[0] > hash.max_bounds[0]:
+            hash.max_bounds[0] = particles[i].loc[0]
+
+        if particles[i].loc[1] < hash.min_bounds[1]:
+            hash.min_bounds[1] = particles[i].loc[1]
+        elif particles[i].loc[1] > hash.max_bounds[1]:
+            hash.max_bounds[1] = particles[i].loc[1]
+
+        if particles[i].loc[2] < hash.min_bounds[2]:
+            hash.min_bounds[2] = particles[i].loc[2]
+        elif particles[i].loc[2] > hash.max_bounds[2]:
+            hash.max_bounds[2] = particles[i].loc[2]
+
+    # Add small padding to avoid edge cases
+    cdef float padding = hash.cell_size * 0.1
+    hash.min_bounds[0] -= padding
+    hash.min_bounds[1] -= padding
+    hash.min_bounds[2] -= padding
+    hash.max_bounds[0] += padding
+    hash.max_bounds[1] += padding
+    hash.max_bounds[2] += padding
+
+    # Calculate grid dimensions
+    hash.grid_width = <int>ceil((hash.max_bounds[0] - hash.min_bounds[0]) / hash.cell_size)
+    hash.grid_height = <int>ceil((hash.max_bounds[1] - hash.min_bounds[1]) / hash.cell_size)
+    hash.grid_depth = <int>ceil((hash.max_bounds[2] - hash.min_bounds[2]) / hash.cell_size)
+    hash.total_cells = hash.grid_width * hash.grid_height * hash.grid_depth
+
+    # Ensure minimum grid size
+    if hash.grid_width < 1: hash.grid_width = 1
+    if hash.grid_height < 1: hash.grid_height = 1
+    if hash.grid_depth < 1: hash.grid_depth = 1
+    hash.total_cells = hash.grid_width * hash.grid_height * hash.grid_depth
+
+
+cdef void SpatialHash_build(SpatialHash *hash, SParticle *particles, int particle_count, float max_search_radius) noexcept nogil:
+    """Build the spatial hash grid using parallel counting sort"""
+    hash.total_particles = particle_count
+    hash.cell_size = max_search_radius * 1.5  # Slightly larger than search radius for efficiency
+
+    if particle_count == 0:
+        return
+
+    # Calculate bounds and grid dimensions
+    SpatialHash_calculate_bounds(hash, particles, particle_count)
+
+    # Allocate or reallocate cell arrays if needed
+    if hash.cell_counts != NULL:
+        free(hash.cell_counts)
+    if hash.cell_starts != NULL:
+        free(hash.cell_starts)
+    if hash.temp_counts != NULL:
+        free(hash.temp_counts)
+
+    hash.cell_counts = <int *>calloc(hash.total_cells, cython.sizeof(int))
+    hash.cell_starts = <int *>malloc(hash.total_cells * cython.sizeof(int))
+    hash.temp_counts = <int *>calloc(hash.total_cells, cython.sizeof(int))
+
+    # Allocate thread-local arrays
+    cdef int thread_id
+    for thread_id in range(hash.num_threads):
+        if hash.thread_cell_counts[thread_id] != NULL:
+            free(hash.thread_cell_counts[thread_id])
+        if hash.thread_particle_indices[thread_id] != NULL:
+            free(hash.thread_particle_indices[thread_id])
+
+        hash.thread_cell_counts[thread_id] = <int *>calloc(hash.total_cells, cython.sizeof(int))
+        hash.thread_particle_indices[thread_id] = <int *>malloc(particle_count * cython.sizeof(int))
+
+    # Phase 1: Count particles per cell (parallel)
+    cdef int i, cell_index
+    with nogil:
+        for i in prange(particle_count, num_threads=hash.num_threads):
+            thread_id = cython.parallel.threadid()
+            cell_index = SpatialHash_get_cell_index(hash,
+                                                    particles[i].loc[0],
+                                                    particles[i].loc[1],
+                                                    particles[i].loc[2])
+            hash.particle_cells[i] = cell_index
+            hash.thread_cell_counts[thread_id][cell_index] += 1
+
+    # Phase 2: Combine thread-local counts
+    for thread_id in range(hash.num_threads):
+        for i in range(hash.total_cells):
+            hash.cell_counts[i] += hash.thread_cell_counts[thread_id][i]
+
+    # Phase 3: Calculate starting positions for each cell
+    hash.cell_starts[0] = 0
+    for i in range(1, hash.total_cells):
+        hash.cell_starts[i] = hash.cell_starts[i-1] + hash.cell_counts[i-1]
+
+    # Phase 4: Sort particles into cells (parallel)
+    # Reset temp_counts for use as current position tracker
+    for i in range(hash.total_cells):
+        hash.temp_counts[i] = 0
+
+    # Use thread-local arrays to avoid race conditions
+    with nogil:
+        for i in prange(particle_count, num_threads=hash.num_threads):
+            thread_id = cython.parallel.threadid()
+            cell_index = hash.particle_cells[i]
+            hash.thread_particle_indices[thread_id][i] = i
+
+    # Sequential phase to maintain deterministic ordering within cells
+    for i in range(particle_count):
+        cell_index = hash.particle_cells[i]
+        hash.particle_indices[hash.cell_starts[cell_index] + hash.temp_counts[cell_index]] = i
+        hash.temp_counts[cell_index] += 1
+
+
+cdef void SpatialHash_query_neighbors(SpatialHash *hash, Particle *particle, Particle *all_particles, float search_radius) noexcept nogil:
+    """Find all neighbors within search_radius of the given particle"""
+    if hash.total_particles == 0:
+        particle.neighboursnum = 0
+        return
+
+    particle.neighboursnum = 0
+
+    cdef float pos[3]
+    pos[0] = particle.loc[0]
+    pos[1] = particle.loc[1]
+    pos[2] = particle.loc[2]
+
+    cdef float search_radius_sq = search_radius * search_radius
+
+    # Determine which cells to check
+    cdef int min_cell_x = <int>floor((pos[0] - search_radius - hash.min_bounds[0]) / hash.cell_size)
+    cdef int max_cell_x = <int>floor((pos[0] + search_radius - hash.min_bounds[0]) / hash.cell_size)
+    cdef int min_cell_y = <int>floor((pos[1] - search_radius - hash.min_bounds[1]) / hash.cell_size)
+    cdef int max_cell_y = <int>floor((pos[1] + search_radius - hash.min_bounds[1]) / hash.cell_size)
+    cdef int min_cell_z = <int>floor((pos[2] - search_radius - hash.min_bounds[2]) / hash.cell_size)
+    cdef int max_cell_z = <int>floor((pos[2] + search_radius - hash.min_bounds[2]) / hash.cell_size)
+
+    # Clamp to valid ranges
+    if min_cell_x < 0: min_cell_x = 0
+    if max_cell_x >= hash.grid_width: max_cell_x = hash.grid_width - 1
+    if min_cell_y < 0: min_cell_y = 0
+    if max_cell_y >= hash.grid_height: max_cell_y = hash.grid_height - 1
+    if min_cell_z < 0: min_cell_z = 0
+    if max_cell_z >= hash.grid_depth: max_cell_z = hash.grid_depth - 1
+
+    cdef int cell_x, cell_y, cell_z, cell_index
+    cdef int start_idx, end_idx, particle_idx, candidate_id
+    cdef float dx, dy, dz, dist_sq
+
+    # Check all relevant cells
+    for cell_x in range(min_cell_x, max_cell_x + 1):
+        for cell_y in range(min_cell_y, max_cell_y + 1):
+            for cell_z in range(min_cell_z, max_cell_z + 1):
+                cell_index = cell_x + cell_y * hash.grid_width + cell_z * hash.grid_width * hash.grid_height
+
+                if cell_index < 0 or cell_index >= hash.total_cells:
+                    continue
+
+                start_idx = hash.cell_starts[cell_index]
+                end_idx = start_idx + hash.cell_counts[cell_index]
+
+                # Check all particles in this cell
+                for particle_idx in range(start_idx, end_idx):
+                    if particle_idx >= hash.total_particles:
+                        break
+
+                    candidate_id = hash.particle_indices[particle_idx]
+
+                    # Skip self
+                    if candidate_id == particle.id:
+                        continue
+
+                    # Calculate distance using passed particle array
+                    dx = pos[0] - all_particles[candidate_id].loc[0]
+                    dy = pos[1] - all_particles[candidate_id].loc[1]
+                    dz = pos[2] - all_particles[candidate_id].loc[2]
+                    dist_sq = dx*dx + dy*dy + dz*dz
+
+                    # Add to neighbors if within radius
+                    if dist_sq <= search_radius_sq:
+                        # Expand neighbor array if needed
+                        if particle.neighboursnum >= particle.neighboursmax:
+                            particle.neighboursmax = particle.neighboursmax * 2
+                            particle.neighbours = <int *>realloc(particle.neighbours,
+                                                                particle.neighboursmax * cython.sizeof(int))
+
+                        particle.neighbours[particle.neighboursnum] = candidate_id
+                        particle.neighboursnum += 1
+
+
+
+#@cython.cdivision(True)
+from libc.math cimport pow, cos, fmax, fmin
+
+cdef void collide(Particle *par)noexcept nogil:
+    global deltatime
+    global deadlinks
+    cdef int *neighbours = NULL
+    cdef Particle *par2 = NULL
+    cdef float stiff = 0
+    cdef float target = 0
+    cdef float sqtarget = 0
+    cdef float adhesion_distance = 0  # Adhesion distance
+    cdef float sq_adhesion_distance = 0
+    cdef float adhesion_factor = 0    # Adhesion strength
+    cdef float lenghtx = 0
+    cdef float lenghty = 0
+    cdef float lenghtz = 0
+    cdef float sqlenght = 0
+    cdef float lenght = 0
+    cdef float invlenght = 0
+    cdef float factor = 0
+    cdef float ratio1 = 0
+    cdef float ratio2 = 0
+    cdef float adhesion_force1 = 0
+    cdef float adhesion_force2 = 0
+    cdef float adhesion_damping = 0
+    cdef float total_force1 = 0
+    cdef float total_force2 = 0
+    cdef float contact_distance = 0  # Distance where particles are just touching
+    cdef float sq_contact_distance = 0
+    cdef float adhesion_scale = 0.0
+    cdef float distance_ratio = 0.0
+    cdef float collision_depth = 0.0
+    cdef float rel_vel_x = 0.0
+    cdef float rel_vel_y = 0.0
+    cdef float rel_vel_z = 0.0
+    cdef float rel_vel_radial = 0.0
+    cdef float adhesion_force_mag = 0.0
+    cdef float damping_factor = 0.0
+    cdef float velocity_damping = 0.0
+    cdef float total_adhesion_force = 0.0
+    cdef float factor1 = 0
+    cdef float factor2 = 0
+    cdef float *col_normal1 = [0, 0, 0]
+    cdef float *col_normal2 = [0, 0, 0]
+    cdef float *ypar_vel = [0, 0, 0]
+    cdef float *xpar_vel = [0, 0, 0]
+    cdef float *yi_vel = [0, 0, 0]
+    cdef float *xi_vel = [0, 0, 0]
+    cdef float friction1 = 0
+    cdef float friction2 = 0
+    cdef float damping1 = 0
+    cdef float damping2 = 0
+    cdef int i = 0
+    cdef int check = 0
+    cdef float Ua = 0
+    cdef float Ub = 0
+    cdef float Cr = 0
+    cdef float Ma = 0
+    cdef float Mb = 0
+    cdef float Va = 0
+    cdef float Vb = 0
+    cdef float force1 = 0
+    cdef float force2 = 0
+    cdef float mathtmp = 0
+
+    if  par.state < 3:
+        return
+    if par.sys.selfcollision_active == False and par.sys.othercollision_active == False:
+        return
+
+    neighbours = par.neighbours
+
+    # for i in range(spatial_hash.num_result):
+    for i in range(par.neighboursnum):
+        check = 0
+        if parlist[i].id == -1:
+            check += 1
+        par2 = &parlist[neighbours[i]]
+        if par.id == par2.id:
+            check += 10
+        if arraysearch(par2.id, par.collided_with, par.collided_num) == -1:
+        # if par2 not in par.collided_with:
+            if par2.sys.id != par.sys.id :
+                if par2.sys.othercollision_active == False or \
+                        par.sys.othercollision_active == False:
+                    check += 100
+
+            if par2.sys.collision_group != par.sys.collision_group:
+                check += 1000
+
+            if par2.sys.id == par.sys.id and \
+                    par.sys.selfcollision_active == False:
+                check += 10000
+
+            stiff = 1.0 / deltatime
+            target = (par.size + par2.size) * 0.999
+            sqtarget = target * target
+
+            if check == 0 and par2.state >= 3 and \
+                    arraysearch(
+                        par2.id, par.link_with, par.link_withnum
+                    ) == -1 and \
+                    arraysearch(
+                        par.id, par2.link_with, par2.link_withnum
+                    ) == -1:
+
+            # if par.state <= 1 and par2.state <= 1 and \
+            #       par2 not in par.link_with and par not in par2.link_with:
+                lenghtx = par.loc[0] - par2.loc[0]
+                lenghty = par.loc[1] - par2.loc[1]
+                lenghtz = par.loc[2] - par2.loc[2]
+                sqlenght  = optimized_square_dist_3d(par.loc, par2.loc)
+
+                # Calculate adhesion parameters
+                contact_distance = par.size + par2.size
+                sq_contact_distance = contact_distance * contact_distance
+                adhesion_distance = contact_distance * (1.0 + par.sys.collision_adhesion_distance)
+                sq_adhesion_distance = adhesion_distance * adhesion_distance
+
+                if sqlenght != 0 and sqlenght < sq_adhesion_distance:
+                    lenght = sqrt(sqlenght)
+                    invlenght = 1 / lenght
+                    ratio1 = (par2.mass / (par.mass + par2.mass))
+                    ratio2 = 1 - ratio1
+
+                    # Initialize total forces
+                    total_force1 = 0
+                    total_force2 = 0
+
+                    # Apply collision force if particles are overlapping (within collision distance)
+                    if sqlenght < sqtarget:  # Collision occurs (particles overlapping)
+                        factor = (lenght - target) * invlenght
+                        mathtmp = factor * stiff
+                        force1 = ratio1 * mathtmp
+                        force2 = ratio2 * mathtmp
+                        total_force1 += force1
+                        total_force2 += force2
+
+                    # Apply adhesion force with velocity-based stabilization
+                    if sqlenght >= sq_contact_distance and sqlenght < sq_adhesion_distance:
+                        adhesion_scale = (lenght - adhesion_distance) / (adhesion_distance - contact_distance)
+                        
+                        # Calculate relative velocity along the connection line
+                        rel_vel_x = par.vel[0] - par2.vel[0]
+                        rel_vel_y = par.vel[1] - par2.vel[1] 
+                        rel_vel_z = par.vel[2] - par2.vel[2]
+                        rel_vel_radial = (rel_vel_x * lenghtx + rel_vel_y * lenghty + rel_vel_z * lenghtz) * invlenght
+                        
+                        # Base adhesion force
+                        adhesion_force_base = -par.sys.collision_adhesion_factor * stiff * adhesion_scale
+                        
+                        # Critical damping to prevent oscillation
+                        # This opposes the radial velocity component
+                        velocity_damping_force = -rel_vel_radial * par.sys.collision_adhesion_factor * stiff * 0.1
+                        
+                        # Combine forces
+                        total_adhesion_force = adhesion_force_base + velocity_damping_force
+                        
+                        # Your original distance-based damping (more damping when closer)
+                        adhesion_damping = (1 - adhesion_scale) * (1 - adhesion_scale) * 0.01
+                        
+                        adhesion_force1 = ratio1 * total_adhesion_force * adhesion_damping
+                        adhesion_force2 = ratio2 * total_adhesion_force * adhesion_damping
+                        total_force1 += adhesion_force1
+                        total_force2 += adhesion_force2
+
+                    # Apply total forces (either adhesion alone, collision alone, or combined)
+                    par.vel[0] -= lenghtx * total_force1
+                    par.vel[1] -= lenghty * total_force1
+                    par.vel[2] -= lenghtz * total_force1
+                    par2.vel[0] += lenghtx * total_force2
+                    par2.vel[1] += lenghty * total_force2
+                    par2.vel[2] += lenghtz * total_force2
+
+                    # Only apply collision-specific physics (damping, friction) if colliding
+                    if sqlenght < sqtarget:
+                        col_normal1[0] = (par2.loc[0] - par.loc[0]) * invlenght
+                        col_normal1[1] = (par2.loc[1] - par.loc[1]) * invlenght
+                        col_normal1[2] = (par2.loc[2] - par.loc[2]) * invlenght
+                        col_normal2[0] = col_normal1[0] * -1
+                        col_normal2[1] = col_normal1[1] * -1
+                        col_normal2[2] = col_normal1[2] * -1
+
+                        factor1 = dot_product(par.vel,col_normal1)
+                        ypar_vel[0] = factor1 * col_normal1[0]
+                        ypar_vel[1] = factor1 * col_normal1[1]
+                        ypar_vel[2] = factor1 * col_normal1[2]
+                        xpar_vel[0] = par.vel[0] - ypar_vel[0]
+                        xpar_vel[1] = par.vel[1] - ypar_vel[1]
+                        xpar_vel[2] = par.vel[2] - ypar_vel[2]
+
+                        factor2 = dot_product(par2.vel, col_normal2)
+                        yi_vel[0] = factor2 * col_normal2[0]
+                        yi_vel[1] = factor2 * col_normal2[1]
+                        yi_vel[2] = factor2 * col_normal2[2]
+                        xi_vel[0] = par2.vel[0] - yi_vel[0]
+                        xi_vel[1] = par2.vel[1] - yi_vel[1]
+                        xi_vel[2] = par2.vel[2] - yi_vel[2]
+
+                        friction1 = 1 - (((par.sys.friction + par2.sys.friction) * 0.5) * ratio1)
+                        friction2 = 1 - (((par.sys.friction + par2.sys.friction) * 0.5) * ratio2)
+                        damping1 = 1 - (((par.sys.collision_damp + par2.sys.collision_damp) * 0.5) * ratio1)
+                        damping2 = 1 - (((par.sys.collision_damp + par2.sys.collision_damp) * 0.5) * ratio2)
+
+                        par.vel[0] = ((ypar_vel[0] * damping1) + (yi_vel[0] * (1 - damping1))) + ((xpar_vel[0] * friction1) + (xi_vel[0] * (1 - friction1)))
+                        par.vel[1] = ((ypar_vel[1] * damping1) + (yi_vel[1] * (1 - damping1))) + ((xpar_vel[1] * friction1) + (xi_vel[1] * (1 - friction1)))
+                        par.vel[2] = ((ypar_vel[2] * damping1) + (yi_vel[2] * (1 - damping1))) + ((xpar_vel[2] * friction1) + (xi_vel[2] * (1 - friction1)))
+                        par2.vel[0] = ((yi_vel[0] * damping2) + (ypar_vel[0] * (1 - damping2))) + ((xi_vel[0] * friction2) + (xpar_vel[0] * (1 - friction2)))
+                        par2.vel[1] = ((yi_vel[1] * damping2) + (ypar_vel[1] * (1 - damping2))) + ((xi_vel[1] * friction2) + (xpar_vel[1] * (1 - friction2)))
+                        par2.vel[2] = ((yi_vel[2] * damping2) + (ypar_vel[2] * (1 - damping2))) + ((xi_vel[2] * friction2) + (xpar_vel[2] * (1 - friction2)))
+
+                    par2.collided_with[par2.collided_num] = par.id
+                    par2.collided_num += 1
+                    par2.collided_with = <int *>realloc(
+                        par2.collided_with,
+                        (par2.collided_num + 1) * cython.sizeof(int)
+                    )
+
+                    if ((par.sys.relink_chance + par2.sys.relink_chance) / 2) > 0:
+                        create_link(par.id, par.sys.link_max * 2, par2.id)
+
+cpdef memfree():
+    global spatialhash
+    global psysnum
+    global parnum
+    global psys
+    global parlist
+    global parlistcopy
+    global fps
+    global substep
+    global deadlinks
+    cdef int i = 0
+
+    fps = 0
+    substep = 0
+    deltatime = 0
+    cpunum = 0
+    newlinks = 0
+    totallinks = 0
+    totaldeadlinks = 0
+    free(deadlinks)
+    deadlinks = NULL
+
+    for i in range(parnum):
+        if parnum >= 1:
+            if parlist[i].neighboursnum >= 1:
+                free(parlist[i].neighbours)
+                parlist[i].neighbours = NULL
+                parlist[i].neighboursnum = 0
+            if parlist[i].collided_num >= 1:
+                free(parlist[i].collided_with)
+                parlist[i].collided_with = NULL
+                parlist[i].collided_num = 0
+            if parlist[i].links_num >= 1:
+                free(parlist[i].links)
+                parlist[i].links = NULL
+                parlist[i].links_num = 0
+                parlist[i].links_activnum = 0
+            if parlist[i].link_withnum >= 1:
+                free(parlist[i].link_with)
+                parlist[i].link_with = NULL
+                parlist[i].link_withnum = 0
+            if parlist[i].neighboursnum >= 1:
+                free(parlist[i].neighbours)
+                parlist[i].neighbours = NULL
+                parlist[i].neighboursnum = 0
+
+    for i in range(psysnum):
+        if psysnum >= 1:
+            psys[i].particles = NULL
+
+    if psysnum >= 1:
+        free(psys)
+        psys = NULL
+
+    if parnum >= 1:
+        free(parlistcopy)
+        parlistcopy = NULL
+        free(parlist)
+        parlist = NULL
+
+    parnum = 0
+    psysnum = 0
+
+    if spatialhash != NULL:
+        SpatialHash_destroy(spatialhash)
+        free(spatialhash)
+        spatialhash = NULL
+
+cdef int arraysearch(int element, int *array, int len)noexcept nogil:
+    cdef int i = 0
+    for i in range(len):
+        if element == array[i]:
+            return i
+    return -1
+
+
+
+
+
+#@cython.cdivision(True)
+cdef float square_dist(float point1[3], float point2[3], int k)noexcept nogil:
+    cdef float sq_dist = 0
+    cdef int i
+    for i in range(k):
+        sq_dist += (point1[i] - point2[i]) * (point1[i] - point2[i])
+    return sq_dist
+
+cdef float optimized_square_dist_3d(float point1[3], float point2[3]) noexcept nogil:
+    # For now, use a simple implementation that will benefit from compiler optimizations
+    cdef float dx = point1[0] - point2[0]
+    cdef float dy = point1[1] - point2[1]
+    cdef float dz = point1[2] - point2[2]
+    return dx*dx + dy*dy + dz*dz
+
+cdef float dot_product(float u[3],float v[3])noexcept nogil:
+    cdef float dot = 0
+    dot = (u[0] * v[0]) + (u[1] * v[1]) + (u[2] * v[2])
+    return dot
+
+
+cdef void quick_sort(SParticle *a, int n, int axis)noexcept nogil:
+    # Use insertion sort for small arrays (hybrid approach)
+    cdef int THRESHOLD = 10
+    if (n < THRESHOLD):
+        insertion_sort(a, n, axis)
+        return
+
+    cdef SParticle t
+    cdef float p = a[int(n / 2)].loc[axis]
+    cdef SParticle *l = a
+    cdef SParticle *r = a + n - 1
+    while l <= r:
+        if l[0].loc[axis] < p:
+            l += 1
+            continue
+
+        if r[0].loc[axis] > p:
+            r -= 1
+            # // we need to check the condition (l <= r) every time
+            #  we change the value of l or r
+            continue
+
+        t = l[0]
+        l[0] = r[0]
+        # suggested by stephan to remove temp variable t but slower
+        # l[0], r[0] = r[0], l[0]
+        l += 1
+        r[0] = t
+        r -= 1
+
+    quick_sort(a, r - a + 1, axis)
+    quick_sort(l, a + n - l, axis)
+
+# Insertion sort implementation for small arrays
+cdef void insertion_sort(SParticle *a, int n, int axis) noexcept nogil:
+    cdef int i, j
+    cdef SParticle key
+    for i in range(1, n):
+        key = a[i]
+        j = i-1
+        while j >=0 and a[j].loc[axis] > key.loc[axis] :
+                a[j+1] = a[j]
+                j -= 1
+        a[j+1] = key
+
+# cdef void quick_sort(SParticle *a, int n, int axis) nogil:
+#     cdef int THRESHOLD = 10  # switch to insertion sort when the size of the array is less than this threshold
+#     if n < THRESHOLD:
+#         insertion_sort(a, n, axis)
+#         return
+
+#     cdef SParticle t
+#     cdef float p = medianfn(a[0].loc[axis], a[n / 2].loc[axis], a[n - 1].loc[axis])  # median of three
+#     cdef SParticle *l = a
+#     cdef SParticle *r = a + n - 1
+#     while l <= r:
+#         if l[0].loc[axis] < p:
+#             l += 1
+#             continue
+
+#         if r[0].loc[axis] > p:
+#             r -= 1
+#             continue
+
+#         t = l[0]
+#         l[0] = r[0]
+#         l += 1
+#         r[0] = t
+#         r -= 1
+
+#     quick_sort(a, r - a + 1, axis)
+#     quick_sort(l, a + n - l, axis)
+
+# cdef void insertion_sort(SParticle *a, int n, int axis) noexcept nogil:
+#     cdef int i, j
+#     cdef SParticle key
+#     for i in range(1, n):
+#         key = a[i]
+#         j = i-1
+#         while j >=0 and a[j].loc[axis] > key.loc[axis] :
+#                 a[j+1] = a[j]
+#                 j -= 1
+#         a[j+1] = key
+
+# cdef float medianfn(float a, float b, float c) nogil:
+#     if a < b:
+#         if b < c:
+#             return b
+#         elif a < c:
+#             return c
+#         else:
+#             return a
+#     else:
+#         if a < c:
+#             return a
+#         elif b < c:
+#             return c
+#         else:
+#             return b
+
+cdef struct Links:
+    float lenght
+    int start
+    int end
+    float stiffness
+    int exponent
+    float damping
+    float broken
+    float estiffness
+    int eexponent
+    float edamping
+    float ebroken
+    float friction
+
+
+cdef struct SpatialHash:
+    float cell_size
+    int grid_width
+    int grid_height
+    int grid_depth
+    int total_cells
+    float min_bounds[3]
+    float max_bounds[3]
+
+    # Cell data arrays
+    int *cell_counts        # Number of particles in each cell
+    int *cell_starts        # Starting index for particles in each cell
+    int *particle_indices   # Sorted particle indices by cell
+    int *particle_cells     # Which cell each particle belongs to
+
+    # Working arrays for construction
+    int *temp_counts        # Temporary cell counts for parallel construction
+    int total_particles
+
+    # Thread-local data for parallel construction
+    int **thread_cell_counts
+    int **thread_particle_indices
+    int num_threads
+
+
+cdef struct ParSys:
+    int id
+    int parnum
+    Particle *particles
+    int selfcollision_active
+    int othercollision_active
+    int collision_group
+    float friction
+    float collision_damp
+    float collision_adhesion_distance
+    float collision_adhesion_factor
+    int links_active
+    float link_length
+    int link_rellength
+    int link_max
+    float link_tension
+    float link_tensionrand
+    float link_stiff
+    float link_stiffrand
+    float link_stiffexp
+    float link_damp
+    float link_damprand
+    float link_broken
+    float link_brokenrand
+    float link_estiff
+    float link_estiffrand
+    float link_estiffexp
+    float link_edamp
+    float link_edamprand
+    float link_ebroken
+    float link_ebrokenrand
+    int relink_group
+    float relink_chance
+    float relink_chancerand
+    int relink_max
+    float relink_tension
+    float relink_tensionrand
+    float relink_stiff
+    float relink_stiffexp
+    float relink_stiffrand
+    float relink_damp
+    float relink_damprand
+    float relink_broken
+    float relink_brokenrand
+    float relink_estiff
+    float relink_estiffexp
+    float relink_estiffrand
+    float relink_edamp
+    float relink_edamprand
+    float relink_ebroken
+    float relink_ebrokenrand
+    float link_friction
+    int link_group
+    int other_link_active
+    # Gravity settings (Barnes-Hut)
+    int gravity_active
+    float gravity_strength
+    float gravity_theta
+    float gravity_softening
+    float gravity_initial_rotation
+    float gravity_rotation_falloff
+
+
+cdef struct SParticle:
+    int id
+    float loc[3]
+
+
+cdef struct Particle:
+    int id
+    float loc[3]
+    float vel[3]
+    float size
+    float mass
+    int state
+    float weak
+
+    ParSys *sys
+    int *collided_with
+    int collided_num
+    Links *links
+    int links_num
+    int links_activnum
+    int *link_with
+    int link_withnum
+    int *neighbours
+    int neighboursnum
+    int neighboursmax
+
+
+cdef struct Pool:
+    int axis
+    float offset
+    float max
+    Parity *parity
+
+
+cdef struct Parity:
+    Heap *heap
+
+
+cdef struct Heap:
+    int *par
+    int parnum
+    int maxalloc
+
+
+# Barnes-Hut Octree structures for gravity simulation
+cdef struct OctreeNode:
+    float center[3]         # Center of this node's bounding box
+    float half_size         # Half the side length of the bounding box
+    float mass              # Total mass of particles in this node
+    float com[3]            # Center of mass of particles in this node
+    int particle_id         # If leaf with single particle, its ID (-1 otherwise)
+    int is_leaf             # 1 if leaf node, 0 if internal
+    int num_particles       # Number of particles in this subtree
+    OctreeNode *children[8] # Pointers to 8 children (NULL if not used)
+
+
+cdef struct Octree:
+    OctreeNode *root        # Root node of the octree
+    OctreeNode *node_pool   # Pre-allocated pool of nodes
+    int pool_size           # Size of node pool
+    int next_free           # Index of next free node in pool
+    float theta             # Opening angle for Barnes-Hut (0.5-1.0)
+    float G                 # Gravitational constant
+    float softening         # Softening parameter to avoid singularities
+
