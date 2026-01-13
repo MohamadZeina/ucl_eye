@@ -63,7 +63,108 @@ otool -L molecular_core/core.cpython-311-darwin.so
 
 ---
 
-## Installation Instructions
+## Compilation Instructions (Windows)
+
+### Prerequisites
+
+1. **Install Python 3.11** (must match Blender 4.5's Python version):
+   - Download from [python.org](https://www.python.org/downloads/release/python-3119/)
+   - During installation, check "Add Python to PATH"
+   - Or use the Microsoft Store version
+
+2. **Install Visual Studio Build Tools** (required for C compiler):
+   - Download [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+   - Run the installer and select **"Desktop development with C++"** workload
+   - This installs MSVC compiler and Windows SDK
+
+3. **Install Cython**:
+   ```cmd
+   pip install cython
+   ```
+
+### Compile the Cython Core Module
+
+Open **"x64 Native Tools Command Prompt for VS 2022"** (from Start menu) and run:
+
+```cmd
+cd C:\path\to\molecular-plus\c_sources
+
+python setup.py build_ext --inplace
+```
+
+This creates `molecular_core/` containing `core.cpython-311-win_amd64.pyd`.
+
+### Verify Compilation
+
+```cmd
+dir molecular_core\*.pyd
+
+REM Should show: core.cpython-311-win_amd64.pyd
+```
+
+---
+
+## Installation Instructions (Windows)
+
+### Option A: Automated Install Script
+
+Create `install.bat` and run it:
+
+```batch
+@echo off
+setlocal
+
+set ADDON_NAME=molecular_plus
+set SOURCE_DIR=%~dp0
+set BLENDER_ADDONS=%APPDATA%\Blender Foundation\Blender\4.5\scripts\addons
+set BLENDER_SITE_PACKAGES=C:\Program Files\Blender Foundation\Blender 4.5\4.5\python\lib\site-packages
+
+echo ========================================
+echo Molecular Plus Plus Installer (Windows)
+echo ========================================
+echo.
+
+REM Create addon directory
+if not exist "%BLENDER_ADDONS%\%ADDON_NAME%" mkdir "%BLENDER_ADDONS%\%ADDON_NAME%"
+
+REM Copy Python files
+echo Copying Python addon files...
+copy /Y "%SOURCE_DIR%*.py" "%BLENDER_ADDONS%\%ADDON_NAME%\"
+
+REM Copy compiled core module
+echo Copying compiled core module...
+xcopy /E /I /Y "%SOURCE_DIR%c_sources\molecular_core" "%BLENDER_SITE_PACKAGES%\molecular_core\"
+
+echo.
+echo Installation complete!
+echo Enable 'Molecular Plus' in Blender: Edit ^> Preferences ^> Add-ons
+pause
+```
+
+### Option B: Manual Installation
+
+1. **Copy Python addon files:**
+   ```cmd
+   mkdir "%APPDATA%\Blender Foundation\Blender\4.5\scripts\addons\molecular_plus"
+   copy C:\path\to\molecular-plus\*.py "%APPDATA%\Blender Foundation\Blender\4.5\scripts\addons\molecular_plus\"
+   ```
+
+2. **Copy compiled core module:**
+   ```cmd
+   xcopy /E /I C:\path\to\molecular-plus\c_sources\molecular_core "C:\Program Files\Blender Foundation\Blender 4.5\4.5\python\lib\site-packages\molecular_core\"
+   ```
+
+   > **Note:** You may need to run Command Prompt as Administrator to copy to Program Files.
+
+3. **Enable in Blender:**
+   - Open Blender
+   - Go to Edit → Preferences → Add-ons
+   - Search for "Molecular"
+   - Enable "Molecular Plus"
+
+---
+
+## Installation Instructions (macOS)
 
 ### Option A: Automated Install Script
 
