@@ -24,7 +24,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -382,6 +382,7 @@ class HEROTRACKER_OT_bake(Operator):
         view_margin = props.view_margin
         switch_margin = props.switch_margin
         selection_mode = props.selection_mode
+        lookahead_frames = props.lookahead_frames
 
         # Get or create hero empty
         hero_empty = get_or_create_hero_empty(context)
@@ -400,7 +401,7 @@ class HEROTRACKER_OT_bake(Operator):
         # Store current frame to restore later
         original_frame = scene.frame_current
 
-        # Helper to get particle data by index
+        # Helper to get particle data by index - O(1) single particle access
         def get_particle_by_index(frame, particle_index):
             """Get particle data for a specific particle index at a given frame."""
             scene.frame_set(frame)
@@ -416,21 +417,15 @@ class HEROTRACKER_OT_bake(Operator):
             if particle_index < 0 or particle_index >= n_particles:
                 return None
 
-            # Get particle data
-            par_loc = array.array('f', [0.0]) * (n_particles * 3)
-            par_size = array.array('f', [0.0]) * n_particles
-            psys_eval.particles.foreach_get('location', par_loc)
-            psys_eval.particles.foreach_get('size', par_size)
-
-            px = par_loc[particle_index * 3]
-            py = par_loc[particle_index * 3 + 1]
-            pz = par_loc[particle_index * 3 + 2]
-            p_loc = Vector((px, py, pz))
+            # O(1) direct access to single particle
+            particle = psys_eval.particles[particle_index]
+            p_loc = Vector(particle.location)
+            p_size = particle.size
 
             cam_loc = camera.matrix_world.translation
             dist = (p_loc - cam_loc).length
 
-            # Get screen coords (ignore in_view for current hero check)
+            # Get screen coords (use large margin to get coords even when off-screen)
             in_view, screen_coords, distance = is_point_in_camera_view(camera, p_loc, 0.5)
 
             if screen_coords is None:
@@ -439,7 +434,7 @@ class HEROTRACKER_OT_bake(Operator):
             return {
                 'index': particle_index,
                 'location': p_loc,
-                'size': par_size[particle_index],
+                'size': p_size,
                 'distance': dist,
                 'screen_x': screen_coords.x,
                 'screen_y': screen_coords.y,
@@ -494,10 +489,32 @@ class HEROTRACKER_OT_bake(Operator):
                 need_new_hero = True
 
             if need_new_hero:
-                # Find best new hero from visible particles
-                new_hero = find_most_prominent_particle(
-                    context, obj, psys_idx, camera, view_margin, selection_mode
-                )
+                # Find best new hero - look ahead to find particle that will be prominent
+                # This creates natural entry animations as particles enter the frame
+                if lookahead_frames > 0:
+                    # Jump to future frame to find the best particle there
+                    future_frame = min(frame + lookahead_frames, frame_end)
+                    scene.frame_set(future_frame)
+                    new_hero_future = find_most_prominent_particle(
+                        context, obj, psys_idx, camera, view_margin, selection_mode
+                    )
+                    # Jump back to current frame
+                    scene.frame_set(frame)
+
+                    if new_hero_future is not None:
+                        # Get this particle's data at the CURRENT frame
+                        new_hero = get_particle_by_index(frame, new_hero_future['index'])
+                    else:
+                        # No particle visible in future, fall back to current frame
+                        new_hero = find_most_prominent_particle(
+                            context, obj, psys_idx, camera, view_margin, selection_mode
+                        )
+                else:
+                    # No lookahead - find best particle at current frame
+                    new_hero = find_most_prominent_particle(
+                        context, obj, psys_idx, camera, view_margin, selection_mode
+                    )
+
                 if new_hero is not None:
                     if current_hero_idx is not None and new_hero['index'] != current_hero_idx:
                         transition_frames.append(frame)
@@ -568,9 +585,10 @@ class HEROTRACKER_OT_bake(Operator):
         # Report results
         total_frames = frame_end - frame_start + 1
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
+        lookahead_info = f", {lookahead_frames}f lookahead" if lookahead_frames > 0 else ""
         self.report(
             {'INFO'},
-            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}, sticky). "
+            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}{lookahead_info}). "
             f"{len(transition_frames)} transitions."
         )
 
@@ -656,6 +674,18 @@ class HeroTrackerProperties(PropertyGroup):
         precision=2
     )
 
+    lookahead_frames: IntProperty(
+        name="Lookahead Frames",
+        description=(
+            "When switching heroes, look this many frames into the future to pick "
+            "the best particle. Creates natural entry animations as particles "
+            "enter the frame. Set to 0 to disable lookahead."
+        ),
+        default=20,
+        min=0,
+        max=120
+    )
+
 
 # =============================================================================
 # UI PANEL
@@ -679,6 +709,13 @@ class HEROTRACKER_PT_main(Panel):
         box.prop(props, "particle_system_name", icon='PARTICLES')
         box.prop(props, "camera", icon='CAMERA_DATA')
         box.prop(props, "selection_mode")
+
+        # Lookahead
+        box.separator()
+        box.label(text="Lookahead:", icon='TIME')
+        box.prop(props, "lookahead_frames")
+        if props.lookahead_frames > 0:
+            box.label(text=f"Pick hero prominent in {props.lookahead_frames}f", icon='INFO')
 
         # Margins
         box.separator()
@@ -762,7 +799,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.4.0 registered")
+    print("Hero Tracker v1.5.0 registered")
 
 
 def unregister():
