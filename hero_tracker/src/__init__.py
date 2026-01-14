@@ -24,7 +24,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 2, 0),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -35,8 +35,9 @@ import bpy
 import array
 import math
 from mathutils import Vector
-from bpy.props import StringProperty, FloatProperty, IntProperty, PointerProperty, EnumProperty
+from bpy.props import StringProperty, FloatProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from bpy.types import Panel, Operator, PropertyGroup
+from bpy_extras.object_utils import world_to_camera_view
 
 
 # =============================================================================
@@ -126,6 +127,69 @@ def is_point_in_camera_view(camera, point, margin=0.0):
     in_view = (lower <= screen_x <= upper) and (lower <= screen_y <= upper)
 
     return in_view, Vector((screen_x, screen_y)), distance
+
+
+def get_screen_radius(scene, camera, center, world_radius):
+    """
+    Get screen-space radius for a sphere.
+
+    Args:
+        scene: Blender scene
+        camera: Camera object
+        center: Vector - 3D world position of sphere center
+        world_radius: Float - radius of sphere in world units
+
+    Returns:
+        (screen_radius, center_screen) where screen_radius is in normalized coords (0-1)
+    """
+    # Get camera's right vector (perpendicular to view)
+    cam_matrix = camera.matrix_world
+    cam_right = cam_matrix.to_3x3() @ Vector((1, 0, 0))
+
+    # Project center and a point offset by radius
+    center_screen = world_to_camera_view(scene, camera, center)
+    edge_point = center + cam_right * world_radius
+    edge_screen = world_to_camera_view(scene, camera, edge_point)
+
+    # Screen radius is the distance between them (in X-Y plane)
+    screen_radius = (Vector(edge_screen[:2]) - Vector(center_screen[:2])).length
+    return screen_radius, center_screen
+
+
+def calculate_view_opacity(screen_x, screen_y, screen_radius):
+    """
+    Calculate opacity based on how much of a particle is visible in frame.
+
+    Args:
+        screen_x, screen_y: Normalized screen coordinates of particle center (0-1)
+        screen_radius: Screen-space radius of particle in normalized coords
+
+    Returns:
+        Float 0-1: 0 = fully out of frame, 1 = fully in frame
+    """
+    if screen_radius <= 0:
+        screen_radius = 0.001  # Avoid division by zero
+
+    # Calculate how far the particle extends beyond each edge
+    # Positive values mean it's outside that edge
+    beyond_left = -screen_x + screen_radius      # How far past left edge (x=0)
+    beyond_right = screen_x + screen_radius - 1  # How far past right edge (x=1)
+    beyond_bottom = -screen_y + screen_radius    # How far past bottom edge (y=0)
+    beyond_top = screen_y + screen_radius - 1    # How far past top edge (y=1)
+
+    # Find the maximum overlap with any edge
+    max_beyond = max(beyond_left, beyond_right, beyond_bottom, beyond_top, 0)
+
+    # If center + radius is fully outside, opacity = 0
+    # Calculate what fraction of the diameter is still visible
+    diameter = screen_radius * 2
+    visible_fraction = max(0, diameter - max_beyond) / diameter
+
+    # Fully out of frame when max_beyond >= diameter
+    if max_beyond >= diameter:
+        return 0.0
+
+    return visible_fraction
 
 
 def find_most_prominent_particle(context, obj, psys_index, camera, margin, mode='CLOSEST'):
@@ -315,8 +379,8 @@ class HEROTRACKER_OT_bake(Operator):
             return {'CANCELLED'}
 
         camera = props.camera
-        margin = props.view_margin
-        fade_frames = props.fade_frames
+        view_margin = props.view_margin
+        switch_margin = props.switch_margin
         selection_mode = props.selection_mode
 
         # Get or create hero empty
@@ -336,93 +400,158 @@ class HEROTRACKER_OT_bake(Operator):
         # Store current frame to restore later
         original_frame = scene.frame_current
 
-        # First pass: collect all frame data
-        frame_data = []
+        # Helper to get particle data by index
+        def get_particle_by_index(frame, particle_index):
+            """Get particle data for a specific particle index at a given frame."""
+            scene.frame_set(frame)
+            depsgraph = context.evaluated_depsgraph_get()
+            obj_eval = obj.evaluated_get(depsgraph)
+
+            if psys_idx >= len(obj_eval.particle_systems):
+                return None
+
+            psys_eval = obj_eval.particle_systems[psys_idx]
+            n_particles = len(psys_eval.particles)
+
+            if particle_index < 0 or particle_index >= n_particles:
+                return None
+
+            # Get particle data
+            par_loc = array.array('f', [0.0]) * (n_particles * 3)
+            par_size = array.array('f', [0.0]) * n_particles
+            psys_eval.particles.foreach_get('location', par_loc)
+            psys_eval.particles.foreach_get('size', par_size)
+
+            px = par_loc[particle_index * 3]
+            py = par_loc[particle_index * 3 + 1]
+            pz = par_loc[particle_index * 3 + 2]
+            p_loc = Vector((px, py, pz))
+
+            cam_loc = camera.matrix_world.translation
+            dist = (p_loc - cam_loc).length
+
+            # Get screen coords (ignore in_view for current hero check)
+            in_view, screen_coords, distance = is_point_in_camera_view(camera, p_loc, 0.5)
+
+            if screen_coords is None:
+                return None
+
+            return {
+                'index': particle_index,
+                'location': p_loc,
+                'size': par_size[particle_index],
+                'distance': dist,
+                'screen_x': screen_coords.x,
+                'screen_y': screen_coords.y,
+            }
+
+        def is_hero_out_of_frame(particle_data, margin):
+            """Check if hero particle is out of frame considering margin."""
+            if particle_data is None:
+                return True
+
+            # Get screen-space radius
+            screen_radius, _ = get_screen_radius(
+                scene, camera, particle_data['location'], particle_data['size']
+            )
+
+            # Check if particle center + radius is outside frame with margin
+            sx = particle_data['screen_x']
+            sy = particle_data['screen_y']
+
+            # Frame boundaries considering margin
+            # Positive margin = larger frame (keep tracking longer, even when outside)
+            # Negative margin = smaller frame (switch sooner, even when still inside)
+            lower = 0.0 - margin
+            upper = 1.0 + margin
+
+            # Particle is out of frame when its center is beyond the margin-adjusted bounds
+            # plus its radius (so the whole particle is out)
+            out_left = sx + screen_radius < lower
+            out_right = sx - screen_radius > upper
+            out_bottom = sy + screen_radius < lower
+            out_top = sy - screen_radius > upper
+
+            return out_left or out_right or out_bottom or out_top
+
+        # First pass: determine hero for each frame using sticky selection
+        frame_heroes = []  # List of (frame, particle_index, particle_data)
+        current_hero_idx = None
+        transition_frames = []
+
         for frame in range(frame_start, frame_end + 1):
             scene.frame_set(frame)
-            particle = find_most_prominent_particle(context, obj, psys_idx, camera, margin, selection_mode)
-            frame_data.append({
-                'frame': frame,
-                'particle': particle,
-            })
 
-        # Detect transitions
-        prev_idx = None
-        transition_frames = []
-        for fd in frame_data:
-            if fd['particle'] is not None:
-                curr_idx = fd['particle']['index']
-                if prev_idx is not None and curr_idx != prev_idx:
-                    transition_frames.append(fd['frame'])
-                prev_idx = curr_idx
+            # Check if current hero is still valid (in frame)
+            need_new_hero = False
+            current_hero_data = None
 
-        # Second pass: bake keyframes with fade logic
+            if current_hero_idx is not None:
+                current_hero_data = get_particle_by_index(frame, current_hero_idx)
+                if is_hero_out_of_frame(current_hero_data, switch_margin):
+                    need_new_hero = True
+            else:
+                need_new_hero = True
+
+            if need_new_hero:
+                # Find best new hero from visible particles
+                new_hero = find_most_prominent_particle(
+                    context, obj, psys_idx, camera, view_margin, selection_mode
+                )
+                if new_hero is not None:
+                    if current_hero_idx is not None and new_hero['index'] != current_hero_idx:
+                        transition_frames.append(frame)
+                    current_hero_idx = new_hero['index']
+                    frame_heroes.append((frame, current_hero_idx, new_hero))
+                else:
+                    # No visible particle
+                    frame_heroes.append((frame, None, None))
+                    current_hero_idx = None
+            else:
+                # Keep tracking current hero
+                frame_heroes.append((frame, current_hero_idx, current_hero_data))
+
+        # Second pass: bake keyframes
         frames_with_particle = 0
         frames_without_particle = 0
 
-        for fd in frame_data:
-            frame = fd['frame']
-            particle = fd['particle']
+        for frame, hero_idx, hero_data in frame_heroes:
+            if hero_data is not None:
+                scene.frame_set(frame)
 
-            if particle is not None:
                 # Set position
-                hero_empty.location = particle['location']
+                hero_empty.location = hero_data['location']
                 hero_empty.keyframe_insert(data_path="location", frame=frame)
 
                 # Set scale based on particle size
-                scale_val = max(particle['size'], 0.01)
+                scale_val = max(hero_data['size'], 0.01)
                 hero_empty.scale = (scale_val, scale_val, scale_val)
                 hero_empty.keyframe_insert(data_path="scale", frame=frame)
 
                 # Keyframe custom properties
-                keyframe_custom_property(hero_empty, 'particle_index', particle['index'], frame)
-                keyframe_custom_property(hero_empty, 'particle_distance', particle['distance'], frame)
-                keyframe_custom_property(hero_empty, 'screen_x', particle['screen_x'], frame)
-                keyframe_custom_property(hero_empty, 'screen_y', particle['screen_y'], frame)
+                keyframe_custom_property(hero_empty, 'particle_index', hero_data['index'], frame)
+                keyframe_custom_property(hero_empty, 'particle_distance', hero_data['distance'], frame)
+                keyframe_custom_property(hero_empty, 'screen_x', hero_data['screen_x'], frame)
+                keyframe_custom_property(hero_empty, 'screen_y', hero_data['screen_y'], frame)
 
                 # is_transition
                 is_trans = 1 if frame in transition_frames else 0
                 keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
 
+                # Calculate and keyframe opacity based on view visibility
+                screen_radius, _ = get_screen_radius(
+                    scene, camera, hero_data['location'], hero_data['size']
+                )
+                opacity = calculate_view_opacity(
+                    hero_data['screen_x'], hero_data['screen_y'], screen_radius
+                )
+                keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
+
                 frames_with_particle += 1
             else:
                 frames_without_particle += 1
 
-        # Third pass: calculate opacity for each frame based on distance to transitions
-        # This handles overlapping fades correctly
-
-        def calculate_opacity(frame, transitions, fade_len):
-            """Calculate opacity based on distance to nearest transition."""
-            if not transitions:
-                return 1.0
-
-            min_dist = float('inf')
-            for t in transitions:
-                dist = abs(frame - t)
-                if dist < min_dist:
-                    min_dist = dist
-
-            if min_dist >= fade_len:
-                return 1.0  # Fully visible
-            else:
-                # Linear fade: 0 at transition, 1 at fade_len frames away
-                return min_dist / fade_len
-
-        # Calculate and keyframe opacity for each frame with a particle
-        prev_opacity = None
-        for fd in frame_data:
-            if fd['particle'] is None:
-                continue
-
-            frame = fd['frame']
-            opacity = calculate_opacity(frame, transition_frames, fade_frames)
-
-            # Only keyframe if value changed (reduces keyframe count)
-            if prev_opacity is None or abs(opacity - prev_opacity) > 0.001:
-                keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
-                prev_opacity = opacity
-
-        # Set interpolation to linear for opacity (smoother fades)
+        # Set interpolation modes
         if hero_empty.animation_data and hero_empty.animation_data.action:
             for fcurve in hero_empty.animation_data.action.fcurves:
                 if 'opacity' in fcurve.data_path:
@@ -441,8 +570,8 @@ class HEROTRACKER_OT_bake(Operator):
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
         self.report(
             {'INFO'},
-            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}). "
-            f"{len(transition_frames)} transitions with {fade_frames}-frame fades."
+            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}, sticky). "
+            f"{len(transition_frames)} transitions."
         )
 
         return {'FINISHED'}
@@ -513,12 +642,18 @@ class HeroTrackerProperties(PropertyGroup):
         precision=2
     )
 
-    fade_frames: IntProperty(
-        name="Fade Frames",
-        description="Number of frames to fade out/in during particle transitions",
-        default=3,
-        min=1,
-        max=30
+    switch_margin: FloatProperty(
+        name="Switch Margin",
+        description=(
+            "Margin for hero switching (fraction of frame). "
+            "Positive = keep tracking hero even when slightly outside frame. "
+            "Negative = switch sooner, even when hero is still slightly inside frame."
+        ),
+        default=0.0,
+        min=-0.5,
+        max=0.5,
+        step=1,
+        precision=2
     )
 
 
@@ -544,15 +679,25 @@ class HEROTRACKER_PT_main(Panel):
         box.prop(props, "particle_system_name", icon='PARTICLES')
         box.prop(props, "camera", icon='CAMERA_DATA')
         box.prop(props, "selection_mode")
-        box.prop(props, "view_margin")
-        box.prop(props, "fade_frames")
 
-        # Info about margin
+        # Margins
+        box.separator()
+        box.label(text="Margins:", icon='FULLSCREEN_ENTER')
+        box.prop(props, "view_margin")
+        box.prop(props, "switch_margin")
+
+        # Info about margins
         if props.view_margin != 0:
             if props.view_margin > 0:
-                box.label(text=f"Including {props.view_margin*100:.0f}% outside frame", icon='INFO')
+                box.label(text=f"Candidates: +{props.view_margin*100:.0f}% outside", icon='INFO')
             else:
-                box.label(text=f"Excluding {abs(props.view_margin)*100:.0f}% at edges", icon='INFO')
+                box.label(text=f"Candidates: -{abs(props.view_margin)*100:.0f}% at edges", icon='INFO')
+
+        if props.switch_margin != 0:
+            if props.switch_margin > 0:
+                box.label(text=f"Switch: +{props.switch_margin*100:.0f}% outside", icon='INFO')
+            else:
+                box.label(text=f"Switch: -{abs(props.switch_margin)*100:.0f}% inside", icon='INFO')
 
         layout.separator()
 
@@ -617,7 +762,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.2.0 registered")
+    print("Hero Tracker v1.4.0 registered")
 
 
 def unregister():
