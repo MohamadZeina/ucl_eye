@@ -12,19 +12,26 @@ Custom properties baked on HeroEmpty:
 - screen_x, screen_y: Normalized screen coordinates (0-1)
 - is_transition: 1 if particle changed this frame, 0 otherwise
 
+Optional Text Display:
+- Enable "Text Display" in the panel and provide a CSV file path
+- CSV should have columns: cleaned_title, decoded_abstract
+- A "HeroText" text object will be created and updated each frame
+- Text shows the title and abstract of the currently tracked particle
+
 Usage:
 1. Name your particle system (e.g., "GalaxyParticles")
 2. Open the N-panel > Hero Tracker tab
 3. Enter the particle system name
 4. Select your camera
-5. Click "Bake Hero Track"
-6. An empty called "HeroEmpty" will be keyframed to follow the most prominent particle
+5. (Optional) Enable Text Display and select CSV file
+6. Click "Bake Hero Track"
+7. An empty called "HeroEmpty" will be keyframed to follow the most prominent particle
 """
 
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -34,10 +41,22 @@ bl_info = {
 import bpy
 import array
 import math
+import csv
 from mathutils import Vector
 from bpy.props import StringProperty, FloatProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from bpy.types import Panel, Operator, PropertyGroup
 from bpy_extras.object_utils import world_to_camera_view
+
+
+# =============================================================================
+# TEXT DISPLAY - Global state for frame handler
+# =============================================================================
+
+# Dictionary mapping particle_index -> {"title": str, "abstract": str}
+_paper_data = {}
+
+# Track if our handler is registered
+_text_handler_registered = False
 
 
 # =============================================================================
@@ -350,6 +369,121 @@ def keyframe_custom_property(hero_empty, prop_name, value, frame):
 
 
 # =============================================================================
+# TEXT DISPLAY FUNCTIONS
+# =============================================================================
+
+def load_paper_csv(csv_path):
+    """
+    Load paper data from CSV file.
+
+    Expects columns: cleaned_title, decoded_abstract
+    Returns dict mapping row index -> {"title": str, "abstract": str}
+    """
+    global _paper_data
+    _paper_data = {}
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for idx, row in enumerate(reader):
+                title = row.get('cleaned_title', '')
+                abstract = row.get('decoded_abstract', '')
+                _paper_data[idx] = {
+                    'title': title,
+                    'abstract': abstract
+                }
+        return len(_paper_data)
+    except Exception as e:
+        print(f"Hero Tracker: Error loading CSV: {e}")
+        return 0
+
+
+def get_or_create_hero_text(context):
+    """
+    Get or create the HeroText text object.
+    Returns the text object.
+    """
+    text_name = "HeroText"
+
+    if text_name in bpy.data.objects:
+        return bpy.data.objects[text_name]
+
+    # Create new text object
+    text_data = bpy.data.curves.new(name=text_name, type='FONT')
+    text_data.body = "Waiting for hero..."
+    text_data.align_x = 'LEFT'
+    text_data.align_y = 'TOP'
+
+    text_obj = bpy.data.objects.new(text_name, text_data)
+
+    # Link to scene
+    context.collection.objects.link(text_obj)
+
+    return text_obj
+
+
+def update_hero_text(scene, depsgraph):
+    """
+    Frame change handler - updates HeroText based on current particle_index.
+    """
+    global _paper_data
+
+    if not _paper_data:
+        return
+
+    hero = bpy.data.objects.get("HeroEmpty")
+    text_obj = bpy.data.objects.get("HeroText")
+
+    if not hero or not text_obj:
+        return
+
+    if "particle_index" not in hero:
+        return
+
+    idx = int(hero["particle_index"])
+    paper = _paper_data.get(idx)
+
+    if paper:
+        # Concatenate title and abstract, remove newlines
+        title = paper.get('title', '')
+        abstract = paper.get('abstract', '')
+
+        # Combine and clean up newlines/extra whitespace
+        combined = f"{title} — {abstract}"
+        combined = combined.replace('\n', ' ').replace('\r', ' ')
+        # Collapse multiple spaces
+        while '  ' in combined:
+            combined = combined.replace('  ', ' ')
+
+        text_obj.data.body = combined
+    else:
+        text_obj.data.body = f"No paper data for index {idx}"
+
+
+def register_text_handler():
+    """Register the frame change handler for text updates."""
+    global _text_handler_registered
+
+    # Remove existing handler if present
+    if update_hero_text in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(update_hero_text)
+
+    bpy.app.handlers.frame_change_post.append(update_hero_text)
+    _text_handler_registered = True
+    print("Hero Tracker: Text update handler registered")
+
+
+def unregister_text_handler():
+    """Remove the frame change handler for text updates."""
+    global _text_handler_registered
+
+    if update_hero_text in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(update_hero_text)
+    _text_handler_registered = False
+    print("Hero Tracker: Text update handler removed")
+
+
+# =============================================================================
 # OPERATORS
 # =============================================================================
 
@@ -582,6 +716,19 @@ class HEROTRACKER_OT_bake(Operator):
         # Restore original frame
         scene.frame_set(original_frame)
 
+        # Set up text display if enabled
+        text_info = ""
+        if props.enable_text_display and props.csv_file_path:
+            num_papers = load_paper_csv(props.csv_file_path)
+            if num_papers > 0:
+                get_or_create_hero_text(context)
+                register_text_handler()
+                # Trigger initial text update
+                update_hero_text(scene, context.evaluated_depsgraph_get())
+                text_info = f" Text display: {num_papers} papers loaded."
+            else:
+                self.report({'WARNING'}, f"Could not load CSV: {props.csv_file_path}")
+
         # Report results
         total_frames = frame_end - frame_start + 1
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
@@ -589,30 +736,43 @@ class HEROTRACKER_OT_bake(Operator):
         self.report(
             {'INFO'},
             f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}{lookahead_info}). "
-            f"{len(transition_frames)} transitions."
+            f"{len(transition_frames)} transitions.{text_info}"
         )
 
         return {'FINISHED'}
 
 
 class HEROTRACKER_OT_clear(Operator):
-    """Clear hero empty animation"""
+    """Clear hero empty animation and text display"""
     bl_idname = "herotracker.clear"
     bl_label = "Clear Animation"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        hero_name = "HeroEmpty"
+        global _paper_data
+        cleared_items = []
 
+        hero_name = "HeroEmpty"
         if hero_name in bpy.data.objects:
             hero = bpy.data.objects[hero_name]
             if hero.animation_data:
                 hero.animation_data_clear()
-                self.report({'INFO'}, "Animation cleared")
-            else:
-                self.report({'INFO'}, "No animation to clear")
+                cleared_items.append("animation")
+
+        # Unregister text handler
+        if update_hero_text in bpy.app.handlers.frame_change_post:
+            unregister_text_handler()
+            cleared_items.append("text handler")
+
+        # Clear paper data
+        if _paper_data:
+            _paper_data = {}
+            cleared_items.append("paper data")
+
+        if cleared_items:
+            self.report({'INFO'}, f"Cleared: {', '.join(cleared_items)}")
         else:
-            self.report({'WARNING'}, "HeroEmpty not found")
+            self.report({'INFO'}, "Nothing to clear")
 
         return {'FINISHED'}
 
@@ -686,6 +846,26 @@ class HeroTrackerProperties(PropertyGroup):
         max=120
     )
 
+    # Text display properties
+    enable_text_display: BoolProperty(
+        name="Enable Text Display",
+        description=(
+            "Create a text object that displays the title and abstract "
+            "of the currently tracked particle from a CSV file"
+        ),
+        default=False
+    )
+
+    csv_file_path: StringProperty(
+        name="CSV File",
+        description=(
+            "Path to CSV file with paper data. "
+            "Expected columns: cleaned_title, decoded_abstract"
+        ),
+        default="",
+        subtype='FILE_PATH'
+    )
+
 
 # =============================================================================
 # UI PANEL
@@ -735,6 +915,30 @@ class HEROTRACKER_PT_main(Panel):
                 box.label(text=f"Switch: +{props.switch_margin*100:.0f}% outside", icon='INFO')
             else:
                 box.label(text=f"Switch: -{abs(props.switch_margin)*100:.0f}% inside", icon='INFO')
+
+        # Text Display (optional)
+        layout.separator()
+        box = layout.box()
+        box.label(text="Text Display", icon='FONT_DATA')
+        box.prop(props, "enable_text_display")
+
+        if props.enable_text_display:
+            box.prop(props, "csv_file_path")
+            # Show status of text display
+            if _paper_data:
+                box.label(text=f"Loaded: {len(_paper_data)} papers", icon='CHECKMARK')
+            elif props.csv_file_path:
+                box.label(text="CSV not loaded (bake to load)", icon='INFO')
+
+            if "HeroText" in bpy.data.objects:
+                box.label(text="HeroText: Created", icon='CHECKMARK')
+            else:
+                box.label(text="HeroText: Not created", icon='DOT')
+
+            if update_hero_text in bpy.app.handlers.frame_change_post:
+                box.label(text="Handler: Active", icon='CHECKMARK')
+            else:
+                box.label(text="Handler: Inactive", icon='DOT')
 
         layout.separator()
 
@@ -799,10 +1003,16 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.5.0 registered")
+    print("Hero Tracker v1.6.0 registered")
 
 
 def unregister():
+    # Clean up text handler if registered
+    global _paper_data
+    if update_hero_text in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(update_hero_text)
+    _paper_data = {}
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
