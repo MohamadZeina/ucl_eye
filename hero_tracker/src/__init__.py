@@ -31,7 +31,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 6, 0),
+    "version": (1, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -517,6 +517,7 @@ class HEROTRACKER_OT_bake(Operator):
         switch_margin = props.switch_margin
         selection_mode = props.selection_mode
         lookahead_frames = props.lookahead_frames
+        fade_frames = props.fade_frames
 
         # Get or create hero empty
         hero_empty = get_or_create_hero_empty(context)
@@ -689,18 +690,41 @@ class HEROTRACKER_OT_bake(Operator):
                 is_trans = 1 if frame in transition_frames else 0
                 keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
 
-                # Calculate and keyframe opacity based on view visibility
-                screen_radius, _ = get_screen_radius(
-                    scene, camera, hero_data['location'], hero_data['size']
-                )
-                opacity = calculate_view_opacity(
-                    hero_data['screen_x'], hero_data['screen_y'], screen_radius
-                )
-                keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
+                # Note: opacity is keyframed separately in the third pass (transition-based)
 
                 frames_with_particle += 1
             else:
                 frames_without_particle += 1
+
+        # Third pass: keyframe opacity at transition points only
+        # This allows Blender's interpolation to create smooth fades
+        # At transition frame T: opacity=0
+        # At T-N and T+N: opacity=1
+        opacity_keyframes = set()  # Track which frames get opacity keyframes
+
+        # Always keyframe opacity=1 at start and end
+        if frames_with_particle > 0:
+            opacity_keyframes.add((frame_start, 1.0))
+            opacity_keyframes.add((frame_end, 1.0))
+
+        # For each transition, add keyframes
+        for t_frame in transition_frames:
+            # Keyframe at transition: opacity=0
+            opacity_keyframes.add((t_frame, 0.0))
+
+            # Keyframe N frames before: opacity=1 (start of fade out)
+            fade_out_start = t_frame - fade_frames
+            if fade_out_start >= frame_start:
+                opacity_keyframes.add((fade_out_start, 1.0))
+
+            # Keyframe N frames after: opacity=1 (end of fade in)
+            fade_in_end = t_frame + fade_frames
+            if fade_in_end <= frame_end:
+                opacity_keyframes.add((fade_in_end, 1.0))
+
+        # Apply opacity keyframes (sorted by frame for clean processing)
+        for frame, opacity in sorted(opacity_keyframes):
+            keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
 
         # Set interpolation modes
         if hero_empty.animation_data and hero_empty.animation_data.action:
@@ -733,9 +757,10 @@ class HEROTRACKER_OT_bake(Operator):
         total_frames = frame_end - frame_start + 1
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
         lookahead_info = f", {lookahead_frames}f lookahead" if lookahead_frames > 0 else ""
+        fade_info = f", {fade_frames}f fade"
         self.report(
             {'INFO'},
-            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}{lookahead_info}). "
+            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}{lookahead_info}{fade_info}). "
             f"{len(transition_frames)} transitions.{text_info}"
         )
 
@@ -846,6 +871,18 @@ class HeroTrackerProperties(PropertyGroup):
         max=120
     )
 
+    fade_frames: IntProperty(
+        name="Fade Frames",
+        description=(
+            "Number of frames for opacity fade in/out around transitions. "
+            "At the transition frame, opacity=0. N frames before/after, opacity=1. "
+            "Blender interpolates between these keyframes."
+        ),
+        default=10,
+        min=1,
+        max=60
+    )
+
     # Text display properties
     enable_text_display: BoolProperty(
         name="Enable Text Display",
@@ -890,12 +927,14 @@ class HEROTRACKER_PT_main(Panel):
         box.prop(props, "camera", icon='CAMERA_DATA')
         box.prop(props, "selection_mode")
 
-        # Lookahead
+        # Lookahead & Transitions
         box.separator()
-        box.label(text="Lookahead:", icon='TIME')
+        box.label(text="Lookahead & Transitions:", icon='TIME')
         box.prop(props, "lookahead_frames")
         if props.lookahead_frames > 0:
             box.label(text=f"Pick hero prominent in {props.lookahead_frames}f", icon='INFO')
+        box.prop(props, "fade_frames")
+        box.label(text=f"Fade: {props.fade_frames}f out → 0 → {props.fade_frames}f in", icon='INFO')
 
         # Margins
         box.separator()
@@ -1003,7 +1042,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.6.0 registered")
+    print("Hero Tracker v1.7.0 registered")
 
 
 def unregister():
