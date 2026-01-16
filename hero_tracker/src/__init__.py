@@ -878,9 +878,8 @@ class HeroTrackerProperties(PropertyGroup):
             "At the transition frame, opacity=0. N frames before/after, opacity=1. "
             "Blender interpolates between these keyframes."
         ),
-        default=10,
-        min=1,
-        max=60
+        default=30,
+        min=1
     )
 
     # Text display properties
