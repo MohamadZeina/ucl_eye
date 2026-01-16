@@ -31,7 +31,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 7, 0),
+    "version": (1, 8, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -42,6 +42,7 @@ import bpy
 import array
 import math
 import csv
+import random
 from mathutils import Vector
 from bpy.props import StringProperty, FloatProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from bpy.types import Panel, Operator, PropertyGroup
@@ -802,6 +803,110 @@ class HEROTRACKER_OT_clear(Operator):
         return {'FINISHED'}
 
 
+class HEROTRACKER_OT_bake_rotation(Operator):
+    """Bake random rotation keyframes at each hero transition"""
+    bl_idname = "herotracker.bake_rotation"
+    bl_label = "Bake Rotation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.hero_tracker
+
+        # Check if HeroEmpty exists
+        hero_name = "HeroEmpty"
+        if hero_name not in bpy.data.objects:
+            self.report({'ERROR'}, "HeroEmpty not found. Bake hero track first.")
+            return {'CANCELLED'}
+
+        hero_empty = bpy.data.objects[hero_name]
+
+        # Check if it has animation data with particle_index
+        if not hero_empty.animation_data or not hero_empty.animation_data.action:
+            self.report({'ERROR'}, "HeroEmpty has no animation. Bake hero track first.")
+            return {'CANCELLED'}
+
+        action = hero_empty.animation_data.action
+
+        # Find the particle_index F-curve
+        particle_index_fcurve = None
+        for fcurve in action.fcurves:
+            if fcurve.data_path == '["particle_index"]':
+                particle_index_fcurve = fcurve
+                break
+
+        if particle_index_fcurve is None:
+            self.report({'ERROR'}, "No particle_index keyframes found. Bake hero track first.")
+            return {'CANCELLED'}
+
+        # Find transition frames (where particle_index changes)
+        keyframes = particle_index_fcurve.keyframe_points
+        if len(keyframes) < 2:
+            self.report({'WARNING'}, "Not enough keyframes to detect transitions.")
+            return {'CANCELLED'}
+
+        transition_frames = []
+        prev_value = None
+        first_frame = None
+        last_frame = None
+
+        for kf in keyframes:
+            frame = int(kf.co[0])
+            value = int(kf.co[1])
+
+            if first_frame is None:
+                first_frame = frame
+            last_frame = frame
+
+            if prev_value is not None and value != prev_value:
+                transition_frames.append(frame)
+            prev_value = value
+
+        # Set up random seed
+        if props.rotation_seed != 0:
+            random.seed(props.rotation_seed)
+        else:
+            random.seed()  # Use system time
+
+        stddev_rad = math.radians(props.rotation_stddev)
+
+        # Clear existing rotation keyframes
+        rotation_paths = ['rotation_euler']
+        for fcurve in list(action.fcurves):
+            if fcurve.data_path in rotation_paths:
+                action.fcurves.remove(fcurve)
+
+        # Ensure rotation mode is Euler
+        hero_empty.rotation_mode = 'XYZ'
+
+        # Generate rotation keyframes
+        # Start with a random rotation at the first frame
+        all_rotation_frames = [first_frame] + transition_frames
+
+        for frame in all_rotation_frames:
+            rot_x = random.gauss(0, stddev_rad)
+            rot_y = random.gauss(0, stddev_rad)
+            rot_z = random.gauss(0, stddev_rad)
+
+            hero_empty.rotation_euler = (rot_x, rot_y, rot_z)
+            hero_empty.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+        # Set interpolation to smooth (Bezier) for nice transitions
+        for fcurve in action.fcurves:
+            if fcurve.data_path == 'rotation_euler':
+                for keyframe in fcurve.keyframe_points:
+                    keyframe.interpolation = 'BEZIER'
+                    keyframe.handle_left_type = 'AUTO_CLAMPED'
+                    keyframe.handle_right_type = 'AUTO_CLAMPED'
+
+        self.report(
+            {'INFO'},
+            f"Baked rotation: {len(all_rotation_frames)} keyframes "
+            f"(stddev={props.rotation_stddev}°, seed={props.rotation_seed or 'random'})"
+        )
+
+        return {'FINISHED'}
+
+
 # =============================================================================
 # PROPERTIES
 # =============================================================================
@@ -902,6 +1007,28 @@ class HeroTrackerProperties(PropertyGroup):
         subtype='FILE_PATH'
     )
 
+    # Rotation randomization properties
+    rotation_stddev: FloatProperty(
+        name="Rotation Std Dev",
+        description=(
+            "Standard deviation for random rotation in degrees. "
+            "Each axis gets an independent random offset from a Gaussian distribution."
+        ),
+        default=5.0,
+        min=0.0,
+        soft_max=45.0
+    )
+
+    rotation_seed: IntProperty(
+        name="Rotation Seed",
+        description=(
+            "Random seed for reproducible rotations. "
+            "Set to 0 for a different result each time."
+        ),
+        default=0,
+        min=0
+    )
+
 
 # =============================================================================
 # UI PANEL
@@ -978,6 +1105,14 @@ class HEROTRACKER_PT_main(Panel):
             else:
                 box.label(text="Handler: Inactive", icon='DOT')
 
+        # Rotation Randomization
+        layout.separator()
+        box = layout.box()
+        box.label(text="Rotation Randomization", icon='ORIENTATION_GIMBAL')
+        box.prop(props, "rotation_stddev")
+        box.prop(props, "rotation_seed")
+        box.operator("herotracker.bake_rotation", icon='FILE_REFRESH')
+
         layout.separator()
 
         # Actions
@@ -1032,6 +1167,7 @@ classes = (
     HeroTrackerProperties,
     HEROTRACKER_OT_bake,
     HEROTRACKER_OT_clear,
+    HEROTRACKER_OT_bake_rotation,
     HEROTRACKER_PT_main,
 )
 
@@ -1041,7 +1177,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.7.0 registered")
+    print("Hero Tracker v1.8.0 registered")
 
 
 def unregister():
