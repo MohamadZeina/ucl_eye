@@ -195,10 +195,14 @@ cdef void Octree_insert(Octree *tree, OctreeNode *node, Particle *par,
                   node.children[octant].center[2], new_half, depth + 1)
 
 
-cdef void Octree_calculate_force(Octree *tree, OctreeNode *node, Particle *par,
-                                 float *force) noexcept nogil:
-    """Calculate gravitational force on particle from node (recursive Barnes-Hut)"""
-    if node == NULL or node.num_particles == 0:
+cdef void Octree_calculate_force_recursive(Octree *tree, OctreeNode *node, Particle *par,
+                                           float *force, int depth) noexcept nogil:
+    """Calculate gravitational force on particle from node (recursive Barnes-Hut)
+
+    Depth limit prevents stack overflow on Windows (1MB default stack vs 8MB on macOS)
+    """
+    # Depth limit to prevent stack overflow (matches Octree_insert limit)
+    if node == NULL or node.num_particles == 0 or depth > 50:
         return
 
     # Skip self (when leaf contains this particle)
@@ -225,19 +229,31 @@ cdef void Octree_calculate_force(Octree *tree, OctreeNode *node, Particle *par,
         # Node is too close, recurse into children
         for j in range(8):
             if node.children[j] != NULL:
-                Octree_calculate_force(tree, node.children[j], par, force)
+                Octree_calculate_force_recursive(tree, node.children[j], par, force, depth + 1)
+
+
+cdef inline void Octree_calculate_force(Octree *tree, OctreeNode *node, Particle *par,
+                                        float *force) noexcept nogil:
+    """Wrapper for backward compatibility"""
+    Octree_calculate_force_recursive(tree, node, par, force, 0)
 
 
 cdef void apply_barnes_hut_gravity(int num_threads) noexcept nogil:
     """Apply gravitational forces using Barnes-Hut algorithm with parallel force computation"""
     global parlist, parnum, deltatime, gravity_G, gravity_theta, gravity_softening
 
-    cdef int i, j
+    cdef int i, j, tid
     cdef float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX
     cdef float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX
     cdef float cx, cy, cz, half_size
     cdef Octree *octree
-    cdef float force[3]
+
+    # Thread-local force arrays to avoid race conditions
+    # Each thread gets its own 3-float array: [fx, fy, fz]
+    cdef float *thread_forces = <float *>malloc(num_threads * 3 * cython.sizeof(float))
+    if thread_forces == NULL:
+        return
+    cdef float *force
 
     # Find bounding box of all particles
     for i in range(parnum):
@@ -263,9 +279,11 @@ cdef void apply_barnes_hut_gravity(int num_threads) noexcept nogil:
     # Create octree
     octree = Octree_create(parnum, gravity_theta, gravity_G, gravity_softening)
     if octree == NULL:
+        free(thread_forces)
         return
     octree.root = allocate_node(octree)
     if octree.root == NULL:
+        free(thread_forces)
         Octree_destroy(octree)
         return
     octree.root.center[0] = cx
@@ -279,8 +297,11 @@ cdef void apply_barnes_hut_gravity(int num_threads) noexcept nogil:
             Octree_insert(octree, octree.root, &parlist[i], cx, cy, cz, half_size, 0)
 
     # Calculate forces and update velocities (PARALLEL - each particle independent)
+    # Using thread-local force arrays: each thread writes to its own memory
     for i in prange(parnum, schedule='dynamic', chunksize=64, num_threads=num_threads):
         if parlist[i].state >= 3:
+            tid = threadid()
+            force = &thread_forces[tid * 3]  # Thread-local force array
             force[0] = 0.0
             force[1] = 0.0
             force[2] = 0.0
@@ -291,6 +312,7 @@ cdef void apply_barnes_hut_gravity(int num_threads) noexcept nogil:
             parlist[i].vel[2] = parlist[i].vel[2] + force[2] * deltatime
 
     # Cleanup
+    free(thread_forces)
     Octree_destroy(octree)
 
 

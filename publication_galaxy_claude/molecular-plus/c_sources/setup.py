@@ -14,6 +14,7 @@ if os.path.exists("build"):
     shutil.rmtree("build")
 if os.path.exists("molecular_core"):
     shutil.rmtree("molecular_core")
+if os.path.exists("molecular_core.egg-info"):
     shutil.rmtree("molecular_core.egg-info")
 
 # Check if compiled core.* exists then remove it
@@ -58,12 +59,16 @@ if not DEBUG_MODE:
                 module_name,
                 ["molecular_core/core.pyx"],
                 extra_compile_args=[
-                    "/Ox",
-                    "/openmp",
-                    "/GT",
-                    "/arch:AVX2",
-                    "/fp:fast",
-                ],  # ['/Ox','/openmp:llvm','/GT','/arch:SSE2','/fp:fast', '/wd4244', '/MD']
+                    "/O2",
+                    "/openmp",  # RE-ENABLED - race condition fixed with thread-local force arrays
+                    "/arch:SSE2",
+                    "/fp:precise",
+                    "/wd4244",
+                    "/MD",
+                ],
+                extra_link_args=[
+                    "/STACK:8388608",  # 8MB stack (matches macOS default, up from Windows 1MB)
+                ],
             )
         ]
 
@@ -184,9 +189,6 @@ if not DEBUG_MODE:
 # Check if Build exists then remove it
 if os.path.exists("build"):
     shutil.rmtree("build")
-if os.path.exists("molecular_core"):
-    shutil.rmtree("molecular_core")
-    shutil.rmtree("molecular_core.egg-info")
 
 # Check if compiled core.* exists then remove it
 if os.path.isfile("core.html"):
