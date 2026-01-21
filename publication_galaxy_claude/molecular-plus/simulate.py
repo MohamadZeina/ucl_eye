@@ -87,6 +87,15 @@ def calculate_sizes_from_csv(psys_settings, num_particles):
         return None
 
 
+def relax_particle_overlaps(par_loc, par_size, max_iterations=100, min_separation=1.001, strength=0.8, num_threads=4):
+    """
+    Push overlapping particles apart until no overlaps remain.
+    Calls into Cython spatial-hash implementation for O(n) performance.
+    """
+    from molecular_core import core
+    return core.relax_overlaps(par_loc, par_size, max_iterations, min_separation, strength, num_threads)
+
+
 def get_gn_float_attr(obj, mod_name, attr_name, weak_map):
     # Find target modifier index
     for target_idx, mod in enumerate(obj.modifiers):
@@ -412,6 +421,24 @@ def pack_data(context, initiate):
                         psys_settings.mol_relink_ebrokenrand = (
                             psys_settings.mol_relink_brokenrand
                         )
+
+                    # Pre-simulation overlap relaxation
+                    if psys_settings.mol_relax_overlaps:
+                        iters, initial, final = relax_particle_overlaps(
+                            par_loc,
+                            par_size,
+                            max_iterations=psys_settings.mol_relax_iterations,
+                            min_separation=psys_settings.mol_relax_separation,
+                            strength=psys_settings.mol_relax_strength,
+                            num_threads=scene.mol_cpu
+                        )
+                        if initial > 0:
+                            if final == 0:
+                                print(f"  Relaxation: {initial} overlaps resolved in {iters} iterations")
+                            else:
+                                print(f"  Relaxation: {initial} initial overlaps, {final} remaining after {iters} iterations (increase iterations)")
+                        else:
+                            print(f"  Relaxation: no overlaps detected")
 
                     params = [0] * 56
 

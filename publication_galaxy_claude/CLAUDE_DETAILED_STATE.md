@@ -221,6 +221,53 @@ core.memfree callable: True
 
 4. **Wheel build fails**: The script tries to build a wheel at the end which fails (calls `python` not `python3.11`). The .so compilation succeeds before this - ignore the error.
 
+### Backing Up Compiled Versions
+
+**IMPORTANT**: Before making changes to Cython code, back up the current known-good compiled binary. This allows rollback if compilation breaks.
+
+**Backup Location**: `publication_galaxy_claude/molecular-plus/compiled_backups/`
+
+**Naming Convention**: `{module}_{platform}_{date}_{git-commit}.{ext}`
+- Example: `core_macos_arm64_20260121_93ea991.so`
+- Example: `core_ubuntu_x86_64_20260122_abc1234.so`
+- Example: `core_windows_x86_64_20260122_abc1234.pyd`
+
+**How to Back Up (Safe - Won't Interrupt Running Simulations)**:
+
+```bash
+# Get current commit hash and date
+COMMIT_SHORT=$(git rev-parse --short HEAD)
+DATE=$(date +%Y%m%d)
+
+# Create backup directory if needed
+mkdir -p publication_galaxy_claude/molecular-plus/compiled_backups
+
+# Copy from the REPO copy (NOT from Blender's site-packages)
+# This is safe even while Blender is running a simulation
+cp publication_galaxy_claude/molecular-plus/molecular_core/core.cpython-311-darwin.so \
+   publication_galaxy_claude/molecular-plus/compiled_backups/core_macos_arm64_${DATE}_${COMMIT_SHORT}.so
+
+cp publication_galaxy_claude/molecular-plus/molecular_core/libomp.dylib \
+   publication_galaxy_claude/molecular-plus/compiled_backups/libomp_macos_arm64_${DATE}_${COMMIT_SHORT}.dylib
+```
+
+**How to Restore**:
+
+```bash
+# Copy backup back to molecular_core/
+cp compiled_backups/core_macos_arm64_20260121_93ea991.so molecular_core/core.cpython-311-darwin.so
+
+# Then reinstall to Blender (requires Blender restart)
+cp -r molecular_core/ "/Applications/Blender 4.5.app/Contents/Resources/4.5/python/lib/python3.11/site-packages/"
+```
+
+**What's Safe**:
+- Copying files from the repo's `molecular_core/` folder - never touches Blender
+- Creating backups in `compiled_backups/` - just file copies
+
+**What Requires Blender Restart**:
+- Copying to Blender's `site-packages/` - only do this when Blender is closed or between simulations
+
 ---
 
 ## FILE STRUCTURE

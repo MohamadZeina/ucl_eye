@@ -38,6 +38,7 @@ filenames = [
     "memory.pyx",
     "utils.pyx",
     "structures.pyx",
+    "relax.pyx",
 ]
 
 with open("./molecular_core/core.pyx", "w") as outfile:

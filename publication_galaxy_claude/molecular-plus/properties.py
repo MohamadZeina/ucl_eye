@@ -191,6 +191,36 @@ def define_props():
         default="0",
     )
 
+    # Pre-simulation overlap relaxation
+    parset.mol_relax_overlaps = bpy.props.BoolProperty(
+        name="Relax Overlaps",
+        description="Push apart overlapping particles before simulation starts. Prevents explosive repulsion from initial overlaps",
+        default=True,
+    )
+    parset.mol_relax_iterations = bpy.props.IntProperty(
+        name="Max Iterations",
+        description="Maximum relaxation iterations. More iterations = guaranteed no overlaps but slower startup. 100 is usually enough",
+        default=100,
+        min=1,
+        max=1000,
+    )
+    parset.mol_relax_separation = bpy.props.FloatProperty(
+        name="Separation",
+        description="Target separation as multiplier of sum of radii. 1.0=touching, 1.001=tiny gap (recommended), 1.1=10% gap",
+        default=1.001,
+        min=1.0,
+        max=2.0,
+        precision=4,
+    )
+    parset.mol_relax_strength = bpy.props.FloatProperty(
+        name="Strength",
+        description="How aggressively to push particles apart. 0.5=gentle (stable), 1.0=full correction (fast but may overshoot), 0.8=recommended",
+        default=0.8,
+        min=0.1,
+        max=1.5,
+        precision=2,
+    )
+
     parset.mol_collision_group = bpy.props.IntProperty(
         name="Collide only with:",
         default=1,

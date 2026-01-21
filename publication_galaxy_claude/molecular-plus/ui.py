@@ -455,6 +455,16 @@ class MS_PT_MolecularPanel(bpy.types.Panel):
         row = box.row()
         row.prop(psys.settings, "mol_csv_field_level", text="Field Level")
 
+        # Overlap relaxation options
+        row = box.row()
+        row.prop(psys.settings, "mol_relax_overlaps", text="Relax Overlaps")
+        if psys.settings.mol_relax_overlaps:
+            row = box.row()
+            row.prop(psys.settings, "mol_relax_iterations", text="Max Iterations")
+            row.prop(psys.settings, "mol_relax_strength", text="Strength")
+            row = box.row()
+            row.prop(psys.settings, "mol_relax_separation", text="Separation")
+
         # Restore sizes button (for reopened files with baked simulations)
         row = box.row()
         row.operator("object.mol_restore_sizes", text="Restore Sizes from CSV", icon="FILE_REFRESH")
