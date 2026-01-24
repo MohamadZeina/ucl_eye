@@ -87,6 +87,103 @@ def calculate_sizes_from_csv(psys_settings, num_particles):
         return None
 
 
+def calculate_fields_from_csv(psys_settings, num_particles):
+    """
+    Calculate particle field IDs from CSV file using current settings.
+    Returns array of field IDs (3 components per particle for angular_velocity),
+    or None if no CSV or no field column.
+
+    This can be called independently to restore field colors without re-simulating.
+    """
+    csv_path = psys_settings.mol_initial_csv
+    if not csv_path:
+        return None
+
+    csv_path_abs = bpy.path.abspath(csv_path)
+    if not os.path.exists(csv_path_abs):
+        print(f"  CSV file not found: {csv_path_abs}")
+        return None
+
+    # Initialize field array (3 components per particle: field_id, 0, 0)
+    par_field = array.array("f", [0.0, 0.0, 0.0]) * num_particles
+
+    try:
+        with open(csv_path_abs) as f:
+            reader = csv_module.DictReader(f)
+            fieldnames = reader.fieldnames
+
+            # Detect field/category column for coloring
+            # Use user-selected field level if available
+            field_col = None
+            if 'field_id' in fieldnames:
+                field_col = 'field_id'
+            else:
+                # Check for field_level_X based on user selection
+                selected_level = psys_settings.mol_csv_field_level
+                level_col = f'field_level_{selected_level}'
+                if level_col in fieldnames:
+                    field_col = level_col
+                # Fallback to any available field_level
+                elif 'field_level_0' in fieldnames:
+                    field_col = 'field_level_0'
+                elif 'field_level_1' in fieldnames:
+                    field_col = 'field_level_1'
+                elif 'field_level_2' in fieldnames:
+                    field_col = 'field_level_2'
+                elif 'mid_level' in fieldnames:
+                    field_col = 'mid_level'
+                elif 'field' in fieldnames:
+                    field_col = 'field'
+                elif 'category' in fieldnames:
+                    field_col = 'category'
+                elif 'cluster' in fieldnames:
+                    field_col = 'cluster'
+
+            if not field_col:
+                print(f"  No field column found in CSV")
+                return None
+
+            # Build field name to ID mapping (for string fields like "Medicine")
+            field_to_id = {}
+            next_field_id = 0
+            fields_set = 0
+
+            # Process rows
+            for idx, row in enumerate(reader):
+                if idx >= num_particles:
+                    break
+
+                if row.get(field_col):
+                    field_val = row[field_col]
+                    try:
+                        # Try numeric first
+                        field_id = float(field_val)
+                    except (ValueError, TypeError):
+                        # String field name - convert to ID
+                        if field_val not in field_to_id:
+                            field_to_id[field_val] = next_field_id
+                            next_field_id += 1
+                        field_id = float(field_to_id[field_val])
+
+                    par_field[idx * 3] = field_id
+                    par_field[idx * 3 + 1] = 0.0  # Y unused
+                    par_field[idx * 3 + 2] = 0.0  # Z unused
+                    fields_set += 1
+
+        # Print field name to ID mapping if string fields were converted
+        if field_to_id:
+            print(f"  Field mapping ({field_col}):")
+            for name, fid in sorted(field_to_id.items(), key=lambda x: x[1]):
+                print(f"    {fid}: {name}")
+
+        print(f"  CSV fields restored: {fields_set} particles with field IDs from '{field_col}'")
+        return par_field
+
+    except Exception as e:
+        print(f"  Error reading CSV for fields: {e}")
+        return None
+
+
 def relax_particle_overlaps(par_loc, par_size, max_iterations=100, min_separation=1.001, strength=0.8, num_threads=4):
     """
     Push overlapping particles apart until no overlaps remain.

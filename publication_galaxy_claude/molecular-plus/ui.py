@@ -465,9 +465,10 @@ class MS_PT_MolecularPanel(bpy.types.Panel):
             row = box.row()
             row.prop(psys.settings, "mol_relax_separation", text="Separation")
 
-        # Restore sizes button (for reopened files with baked simulations)
+        # Restore buttons (for reopened files with baked simulations)
         row = box.row()
-        row.operator("object.mol_restore_sizes", text="Restore Sizes from CSV", icon="FILE_REFRESH")
+        row.operator("object.mol_restore_sizes", text="Restore Sizes", icon="FILE_REFRESH")
+        row.operator("object.mol_restore_fields", text="Restore Colors", icon="COLOR")
 
         # Show CSV info if file is set
         csv_path = psys.settings.mol_initial_csv

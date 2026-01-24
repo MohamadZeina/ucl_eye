@@ -811,6 +811,51 @@ class MolRestoreSizes(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MolRestoreFields(bpy.types.Operator):
+    """Restore particle field IDs (colors) from CSV without re-simulating.
+    Use this after reopening a file with baked simulation."""
+
+    bl_idname = "object.mol_restore_fields"
+    bl_label = "Restore Field IDs from CSV"
+
+    def execute(self, context):
+        from . import simulate
+
+        global _mol_field_cache
+
+        scene = context.scene
+        _mol_field_cache[scene.name] = []
+
+        restored_count = 0
+
+        for ob in bpy.data.objects:
+            obj = get_object(context, ob)
+            for psys in obj.particle_systems:
+                if psys.settings.mol_active and len(psys.particles):
+                    num_particles = len(psys.particles)
+
+                    # Calculate field IDs from CSV
+                    par_field = simulate.calculate_fields_from_csv(psys.settings, num_particles)
+
+                    if par_field is not None:
+                        _mol_field_cache[scene.name].append(par_field)
+                        psys.particles.foreach_set("angular_velocity", par_field)
+                        restored_count += 1
+                        print(f"  Restored field IDs for {psys.settings.name} ({num_particles} particles)")
+                    else:
+                        # No field data available
+                        _mol_field_cache[scene.name].append(None)
+
+        # Register handlers to keep field IDs applied
+        if _mol_apply_sizes_handler not in bpy.app.handlers.frame_change_post:
+            bpy.app.handlers.frame_change_post.append(_mol_apply_sizes_handler)
+        if _mol_apply_sizes_handler not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(_mol_apply_sizes_handler)
+
+        self.report({'INFO'}, f"Restored field IDs for {restored_count} particle system(s)")
+        return {"FINISHED"}
+
+
 operator_classes = (
     MolSimulateModal,
     MolSimulate,
@@ -826,4 +871,5 @@ operator_classes = (
     MolRemoveCollider,
     MolToolsConvertGeo,
     MolRestoreSizes,
+    MolRestoreFields,
 )
