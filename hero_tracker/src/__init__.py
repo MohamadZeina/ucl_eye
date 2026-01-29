@@ -1141,12 +1141,11 @@ class HeroTrackerProperties(PropertyGroup):
         description=(
             "Evaluate every N frames for faster baking. "
             "1 = every frame (most accurate), 2 = every other frame (~2x faster), "
-            "3 = every third frame (~3x faster). Blender interpolates between keyframes."
+            "Higher values give faster bakes. Blender interpolates between keyframes."
         ),
         default=1,
         min=1,
-        max=10,
-        soft_max=4
+        soft_max=100
     )
 
     # Text display properties
