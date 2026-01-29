@@ -34,7 +34,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (3, 0, 1),
+    "version": (3, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -531,6 +531,17 @@ class HEROTRACKER_OT_bake(Operator):
         frame_end = scene.frame_end
         total_frames = frame_end - frame_start + 1
 
+        # Build list of frames to evaluate based on frame_step
+        frame_step = props.frame_step
+        if frame_step == 1:
+            eval_frames = list(range(frame_start, frame_end + 1))
+        else:
+            eval_frames = list(range(frame_start, frame_end + 1, frame_step))
+            # Always include the last frame for clean loop closure
+            if frame_end not in eval_frames:
+                eval_frames.append(frame_end)
+        total_eval_frames = len(eval_frames)
+
         # Store current frame to restore later
         original_frame = scene.frame_current
 
@@ -602,22 +613,51 @@ class HEROTRACKER_OT_bake(Operator):
                 'transition_frames': [],
             }
 
-        print(f"Hero Tracker: Baking {total_frames} frames for {len(cameras)} camera(s)...")
+        def format_duration(seconds):
+            """Format seconds into human-readable duration (s/m/h)."""
+            if seconds < 1:
+                return "<1s"
+            elif seconds < 60:
+                return f"{seconds:.0f}s"
+            elif seconds < 3600:
+                mins = int(seconds // 60)
+                secs = int(seconds % 60)
+                return f"{mins}m {secs}s" if secs > 0 else f"{mins}m"
+            else:
+                hours = int(seconds // 3600)
+                mins = int((seconds % 3600) // 60)
+                if mins > 0:
+                    return f"{hours}h {mins}m"
+                else:
+                    return f"{hours}h"
+
+        if frame_step == 1:
+            print(f"Hero Tracker: Baking {total_frames} frames for {len(cameras)} camera(s)...")
+        else:
+            print(f"Hero Tracker: Baking {total_eval_frames}/{total_frames} frames (step={frame_step}, ~{frame_step}x faster) for {len(cameras)} camera(s)...")
         bake_start_time = time.time()
 
         # =====================================================================
-        # PASS 1: Single pass through all frames, process all cameras per frame
+        # PASS 1: Evaluate selected frames, process all cameras per frame
         # =====================================================================
-        for i, frame in enumerate(range(frame_start, frame_end + 1)):
-            if i == 0 or (i + 1) % 10 == 0 or i == total_frames - 1:
-                pct = 100 * (i + 1) / total_frames
+        for i, frame in enumerate(eval_frames):
+            if i == 0 or (i + 1) % 10 == 0 or i == total_eval_frames - 1:
+                pct = 100 * (i + 1) / total_eval_frames
                 elapsed = time.time() - bake_start_time
                 if i > 0:
-                    eta = elapsed / (i + 1) * (total_frames - i - 1)
-                    eta_str = f", ETA: {eta:.0f}s" if eta >= 1 else ", ETA: <1s"
+                    time_per_frame = elapsed / (i + 1)
+                    eta = time_per_frame * (total_eval_frames - i - 1)
+                    eta_str = f", ETA: {format_duration(eta)}"
+                    # Theoretical projections for 1k/10k/100k timeline frames
+                    # With step=2, 100k timeline = ~50k evaluated, so divide by frame_step
+                    proj_1k = format_duration(time_per_frame * 1000 / frame_step)
+                    proj_10k = format_duration(time_per_frame * 10000 / frame_step)
+                    proj_100k = format_duration(time_per_frame * 100000 / frame_step)
+                    proj_str = f" | 1k: {proj_1k}, 10k: {proj_10k}, 100k: {proj_100k}"
                 else:
                     eta_str = ""
-                print(f"  Pass 1/2: Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
+                    proj_str = ""
+                print(f"  Pass 1/2: Frame {frame} ({i + 1}/{total_eval_frames}) - {pct:.1f}%{eta_str}{proj_str}")
 
             scene.frame_set(frame)
 
@@ -751,7 +791,10 @@ class HEROTRACKER_OT_bake(Operator):
 
         # Build results summary
         results_str = ", ".join([f"{s}: {r['transitions']} trans" for s, r in results.items()])
-        print(f"Hero Tracker: Bake complete in {total_time:.1f}s. {results_str}")
+        if frame_step == 1:
+            print(f"Hero Tracker: Bake complete in {total_time:.1f}s. {results_str}")
+        else:
+            print(f"Hero Tracker: Bake complete in {total_time:.1f}s ({total_eval_frames}/{total_frames} frames, step={frame_step}). {results_str}")
 
         # Set up text display if enabled
         text_info = ""
@@ -770,9 +813,13 @@ class HEROTRACKER_OT_bake(Operator):
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
         cam_info = f"{len(cameras)} cam" if len(cameras) > 1 else "1 cam"
         total_trans = sum(r['transitions'] for r in results.values())
+        if frame_step == 1:
+            frame_info = f"{total_frames}f"
+        else:
+            frame_info = f"{total_eval_frames}/{total_frames}f (step={frame_step})"
         self.report(
             {'INFO'},
-            f"Baked {total_frames}f x {cam_info} ({mode_name}). {total_trans} transitions.{text_info}"
+            f"Baked {frame_info} x {cam_info} ({mode_name}). {total_trans} transitions.{text_info}"
         )
 
         return {'FINISHED'}
@@ -978,8 +1025,11 @@ class HEROTRACKER_OT_export_titles(Operator):
             for start, end, idx in segments:
                 paper = _paper_data.get(idx, {})
                 title = paper.get('title', f'[No data for particle {idx}]')
+                abstract = paper.get('abstract', '')
                 all_lines.append(f"Frames {start}-{end} | Particle {idx}")
-                all_lines.append(f"  {title}")
+                all_lines.append(f"  Title: {title}")
+                if abstract:
+                    all_lines.append(f"  Abstract: {abstract}")
                 all_lines.append("")
                 if idx not in seen:
                     seen.add(idx)
@@ -1086,6 +1136,19 @@ class HeroTrackerProperties(PropertyGroup):
         min=1
     )
 
+    frame_step: IntProperty(
+        name="Frame Step",
+        description=(
+            "Evaluate every N frames for faster baking. "
+            "1 = every frame (most accurate), 2 = every other frame (~2x faster), "
+            "3 = every third frame (~3x faster). Blender interpolates between keyframes."
+        ),
+        default=1,
+        min=1,
+        max=10,
+        soft_max=4
+    )
+
     # Text display properties
     enable_text_display: BoolProperty(
         name="Enable Text Display",
@@ -1171,6 +1234,13 @@ class HEROTRACKER_PT_main(Panel):
         if props.lookahead_frames > 0:
             box.label(text=f"Pick hero prominent in {props.lookahead_frames}f", icon='INFO')
         box.prop(props, "fade_frames")
+
+        # Performance
+        box.separator()
+        box.label(text="Performance:", icon='SORTTIME')
+        box.prop(props, "frame_step")
+        if props.frame_step > 1:
+            box.label(text=f"~{props.frame_step}x faster (positions interpolated)", icon='INFO')
 
         # Margins
         box.separator()
@@ -1273,7 +1343,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v3.0.1 registered")
+    print("Hero Tracker v3.1.0 registered")
 
 
 def unregister():
