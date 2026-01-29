@@ -34,7 +34,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (3, 0, 0),
+    "version": (3, 0, 1),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -788,14 +788,14 @@ class HEROTRACKER_OT_clear(Operator):
         global _paper_data
         cleared_items = []
 
-        # Clear both fw and bw empties
-        for suffix in ['_fw', '_bw']:
-            hero_name = f"HeroEmpty{suffix}"
+        # Clear fw, bw, and legacy (no suffix) empties
+        for suffix in ['_fw', '_bw', '']:
+            hero_name = f"HeroEmpty{suffix}" if suffix else "HeroEmpty"
             if hero_name in bpy.data.objects:
                 hero = bpy.data.objects[hero_name]
                 if hero.animation_data:
                     hero.animation_data_clear()
-                    cleared_items.append(f"HeroEmpty{suffix}")
+                    cleared_items.append(hero_name)
 
         # Unregister text handler
         if update_hero_text in bpy.app.handlers.frame_change_post:
@@ -1273,7 +1273,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v3.0.0 registered")
+    print("Hero Tracker v3.0.1 registered")
 
 
 def unregister():
