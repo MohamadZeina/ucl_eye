@@ -31,7 +31,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 8, 0),
+    "version": (1, 11, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -43,6 +43,7 @@ import array
 import math
 import csv
 import random
+import time
 from mathutils import Vector
 from bpy.props import StringProperty, FloatProperty, IntProperty, PointerProperty, EnumProperty, BoolProperty
 from bpy.types import Panel, Operator, PropertyGroup
@@ -610,7 +611,22 @@ class HEROTRACKER_OT_bake(Operator):
         current_hero_idx = None
         transition_frames = []
 
-        for frame in range(frame_start, frame_end + 1):
+        total_frames = frame_end - frame_start + 1
+        print(f"Hero Tracker: Baking {total_frames} frames...")
+        bake_start_time = time.time()
+
+        for i, frame in enumerate(range(frame_start, frame_end + 1)):
+            # Progress printout every 10 frames or at start/end
+            if i == 0 or (i + 1) % 10 == 0 or i == total_frames - 1:
+                pct = 100 * (i + 1) / total_frames
+                elapsed = time.time() - bake_start_time
+                if i > 0:
+                    eta = elapsed / (i + 1) * (total_frames - i - 1)
+                    eta_str = f", ETA: {eta:.0f}s" if eta >= 1 else ", ETA: <1s"
+                else:
+                    eta_str = ""
+                print(f"  Pass 1/2: Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
+
             scene.frame_set(frame)
 
             # Check if current hero is still valid (in frame)
@@ -668,7 +684,20 @@ class HEROTRACKER_OT_bake(Operator):
         frames_with_particle = 0
         frames_without_particle = 0
 
-        for frame, hero_idx, hero_data in frame_heroes:
+        pass1_time = time.time() - bake_start_time
+        print(f"  Pass 1 complete in {pass1_time:.1f}s")
+        pass2_start_time = time.time()
+        print(f"  Pass 2/2: Baking keyframes...")
+        for i, (frame, hero_idx, hero_data) in enumerate(frame_heroes):
+            if i == 0 or (i + 1) % 50 == 0 or i == total_frames - 1:
+                pct = 100 * (i + 1) / total_frames
+                elapsed = time.time() - pass2_start_time
+                if i > 0:
+                    eta = elapsed / (i + 1) * (total_frames - i - 1)
+                    eta_str = f", ETA: {eta:.1f}s" if eta >= 0.1 else ", ETA: <0.1s"
+                else:
+                    eta_str = ""
+                print(f"  Pass 2/2: Keyframe {i + 1}/{total_frames} - {pct:.1f}%{eta_str}")
             if hero_data is not None:
                 scene.frame_set(frame)
 
@@ -741,6 +770,11 @@ class HEROTRACKER_OT_bake(Operator):
         # Restore original frame
         scene.frame_set(original_frame)
 
+        pass2_time = time.time() - pass2_start_time
+        total_time = time.time() - bake_start_time
+        print(f"  Pass 2 complete in {pass2_time:.1f}s")
+        print(f"Hero Tracker: Bake complete in {total_time:.1f}s (Pass1: {pass1_time:.1f}s, Pass2: {pass2_time:.1f}s). {len(transition_frames)} transitions found.")
+
         # Set up text display if enabled
         text_info = ""
         if props.enable_text_display and props.csv_file_path:
@@ -755,7 +789,6 @@ class HEROTRACKER_OT_bake(Operator):
                 self.report({'WARNING'}, f"Could not load CSV: {props.csv_file_path}")
 
         # Report results
-        total_frames = frame_end - frame_start + 1
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
         lookahead_info = f", {lookahead_frames}f lookahead" if lookahead_frames > 0 else ""
         fade_info = f", {fade_frames}f fade"
@@ -904,6 +937,85 @@ class HEROTRACKER_OT_bake_rotation(Operator):
             f"(stddev={props.rotation_stddev}°, seed={props.rotation_seed or 'random'})"
         )
 
+        return {'FINISHED'}
+
+
+class HEROTRACKER_OT_export_titles(Operator):
+    """Export hero titles to Blender text editor (reads baked keyframes + CSV)"""
+    bl_idname = "herotracker.export_titles"
+    bl_label = "Export Hero Titles"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        global _paper_data
+        props = context.scene.hero_tracker
+
+        # Validate HeroEmpty exists with animation
+        hero = bpy.data.objects.get("HeroEmpty")
+        if not hero or not hero.animation_data or not hero.animation_data.action:
+            self.report({'ERROR'}, "HeroEmpty not found or has no animation. Bake first.")
+            return {'CANCELLED'}
+
+        # Find particle_index F-curve
+        fcurve = None
+        for fc in hero.animation_data.action.fcurves:
+            if fc.data_path == '["particle_index"]':
+                fcurve = fc
+                break
+
+        if not fcurve or len(fcurve.keyframe_points) == 0:
+            self.report({'ERROR'}, "No particle_index keyframes found.")
+            return {'CANCELLED'}
+
+        # Ensure CSV data is loaded
+        if not _paper_data:
+            if not props.csv_file_path:
+                self.report({'ERROR'}, "No CSV file set. Configure in Text Display section.")
+                return {'CANCELLED'}
+            if load_paper_csv(props.csv_file_path) == 0:
+                self.report({'ERROR'}, f"Failed to load CSV: {props.csv_file_path}")
+                return {'CANCELLED'}
+
+        # Extract hero segments from keyframes (CONSTANT interpolation = value until next keyframe)
+        segments = []
+        prev_idx, start_frame = None, None
+
+        for kf in fcurve.keyframe_points:
+            frame, idx = int(kf.co[0]), int(kf.co[1])
+            if idx != prev_idx:
+                if prev_idx is not None and prev_idx >= 0:
+                    segments.append((start_frame, frame - 1, prev_idx))
+                prev_idx, start_frame = idx, frame
+
+        # Final segment
+        if prev_idx is not None and prev_idx >= 0:
+            segments.append((start_frame, int(fcurve.keyframe_points[-1].co[0]), prev_idx))
+
+        # Build output
+        lines = ["HERO TRACKER - TITLE EXPORT", "=" * 50, ""]
+        seen, unique_titles = set(), []
+
+        for start, end, idx in segments:
+            paper = _paper_data.get(idx, {})
+            title = paper.get('title', f'[No data for particle {idx}]')
+            lines.append(f"Frames {start}-{end} | Particle {idx}")
+            lines.append(f"  {title}")
+            lines.append("")
+            if idx not in seen:
+                seen.add(idx)
+                unique_titles.append((idx, title))
+
+        lines.extend(["=" * 50, f"SUMMARY: {len(segments)} segments, {len(unique_titles)} unique heroes", "", "UNIQUE TITLES:"])
+        for i, (idx, title) in enumerate(unique_titles, 1):
+            lines.append(f"  {i}. [P{idx}] {title}")
+
+        # Write to text block
+        text_name = "HeroTitles"
+        text = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
+        text.clear()
+        text.write("\n".join(lines))
+
+        self.report({'INFO'}, f"Exported {len(unique_titles)} unique heroes to '{text_name}'")
         return {'FINISHED'}
 
 
@@ -1105,6 +1217,10 @@ class HEROTRACKER_PT_main(Panel):
             else:
                 box.label(text="Handler: Inactive", icon='DOT')
 
+            # Export titles button
+            box.separator()
+            box.operator("herotracker.export_titles", icon='TEXT')
+
         # Rotation Randomization
         layout.separator()
         box = layout.box()
@@ -1168,6 +1284,7 @@ classes = (
     HEROTRACKER_OT_bake,
     HEROTRACKER_OT_clear,
     HEROTRACKER_OT_bake_rotation,
+    HEROTRACKER_OT_export_titles,
     HEROTRACKER_PT_main,
 )
 
@@ -1177,7 +1294,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.8.0 registered")
+    print("Hero Tracker v1.11.0 registered")
 
 
 def unregister():
