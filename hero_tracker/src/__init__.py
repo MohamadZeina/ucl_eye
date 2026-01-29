@@ -34,7 +34,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (3, 2, 0),
+    "version": (3, 1, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -713,131 +713,73 @@ class HEROTRACKER_OT_bake(Operator):
         print(f"  Pass 1 complete in {pass1_time:.1f}s")
 
         # =====================================================================
-        # PASS 2: Keyframe all empties from cached data (BULK INSERTION)
+        # PASS 2: Keyframe all empties from cached data
         # =====================================================================
         pass2_start_time = time.time()
-        print(f"  Pass 2/2: Baking keyframes (bulk mode)...")
+        print(f"  Pass 2/2: Baking keyframes...")
 
         results = {}
         for suffix, camera in cameras:
             state = track_state[suffix]
             hero_empty = hero_empties[suffix]
             frame_heroes = state['frame_heroes']
-            transition_frames_set = set(state['transition_frames'])
+            transition_frames = state['transition_frames']
 
-            # Filter to frames with valid particle data
-            valid_frames = [(f, d) for f, idx, d in frame_heroes if d is not None]
-            frames_with_particle = len(valid_frames)
-            frames_without_particle = len(frame_heroes) - frames_with_particle
+            frames_with_particle = 0
+            frames_without_particle = 0
 
-            if frames_with_particle == 0:
-                results[suffix] = {'frames_with_particle': 0, 'transitions': 0}
-                continue
+            for j, (frame, hero_idx, hero_data) in enumerate(frame_heroes):
+                if hero_data is not None:
+                    hero_empty.location = hero_data['location']
+                    hero_empty.keyframe_insert(data_path="location", frame=frame)
 
-            # Ensure animation data exists
-            if not hero_empty.animation_data:
-                hero_empty.animation_data_create()
-            if not hero_empty.animation_data.action:
-                hero_empty.animation_data.action = bpy.data.actions.new(f"{hero_empty.name}Action")
+                    scale_val = max(hero_data['size'], 0.01)
+                    hero_empty.scale = (scale_val, scale_val, scale_val)
+                    hero_empty.keyframe_insert(data_path="scale", frame=frame)
 
-            action = hero_empty.animation_data.action
+                    keyframe_custom_property(hero_empty, 'particle_index', hero_data['index'], frame)
+                    keyframe_custom_property(hero_empty, 'particle_distance', hero_data['distance'], frame)
+                    keyframe_custom_property(hero_empty, 'screen_x', hero_data['screen_x'], frame)
+                    keyframe_custom_property(hero_empty, 'screen_y', hero_data['screen_y'], frame)
 
-            # Clear existing fcurves
-            action.fcurves.clear()
+                    is_trans = 1 if frame in transition_frames else 0
+                    keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
 
-            # Define all fcurves: (data_path, index, interpolation)
-            fcurve_defs = [
-                ('location', 0, 'BEZIER'),
-                ('location', 1, 'BEZIER'),
-                ('location', 2, 'BEZIER'),
-                ('scale', 0, 'BEZIER'),
-                ('scale', 1, 'BEZIER'),
-                ('scale', 2, 'BEZIER'),
-                ('["particle_index"]', 0, 'CONSTANT'),
-                ('["particle_distance"]', 0, 'BEZIER'),
-                ('["screen_x"]', 0, 'BEZIER'),
-                ('["screen_y"]', 0, 'BEZIER'),
-                ('["is_transition"]', 0, 'CONSTANT'),
-            ]
+                    frames_with_particle += 1
+                else:
+                    frames_without_particle += 1
 
-            # Create fcurves and pre-allocate keyframes
-            fcurves = {}
-            for data_path, idx, interp in fcurve_defs:
-                fc = action.fcurves.new(data_path=data_path, index=idx)
-                fc.keyframe_points.add(frames_with_particle)
-                fcurves[(data_path, idx)] = (fc, interp)
-
-            # Bulk insert keyframe values
-            for i, (frame, hero_data) in enumerate(valid_frames):
-                loc = hero_data['location']
-                scale_val = max(hero_data['size'], 0.01)
-                is_trans = 1 if frame in transition_frames_set else 0
-
-                # Location X, Y, Z
-                fcurves[('location', 0)][0].keyframe_points[i].co = (frame, loc.x)
-                fcurves[('location', 1)][0].keyframe_points[i].co = (frame, loc.y)
-                fcurves[('location', 2)][0].keyframe_points[i].co = (frame, loc.z)
-
-                # Scale (uniform)
-                fcurves[('scale', 0)][0].keyframe_points[i].co = (frame, scale_val)
-                fcurves[('scale', 1)][0].keyframe_points[i].co = (frame, scale_val)
-                fcurves[('scale', 2)][0].keyframe_points[i].co = (frame, scale_val)
-
-                # Custom properties
-                fcurves[('["particle_index"]', 0)][0].keyframe_points[i].co = (frame, hero_data['index'])
-                fcurves[('["particle_distance"]', 0)][0].keyframe_points[i].co = (frame, hero_data['distance'])
-                fcurves[('["screen_x"]', 0)][0].keyframe_points[i].co = (frame, hero_data['screen_x'])
-                fcurves[('["screen_y"]', 0)][0].keyframe_points[i].co = (frame, hero_data['screen_y'])
-                fcurves[('["is_transition"]', 0)][0].keyframe_points[i].co = (frame, is_trans)
-
-            # Set interpolation and update all fcurves
-            for (data_path, idx), (fc, interp) in fcurves.items():
-                for kf in fc.keyframe_points:
-                    kf.interpolation = interp
-                fc.update()
-
-            # Handle opacity fcurve separately (different keyframe count)
-            opacity_keyframes = []
+            # Keyframe opacity at transition points
+            opacity_keyframes = set()
             if frames_with_particle > 0:
-                opacity_keyframes.append((frame_start, 1.0))
-                opacity_keyframes.append((frame_end, 1.0))
+                opacity_keyframes.add((frame_start, 1.0))
+                opacity_keyframes.add((frame_end, 1.0))
 
-            for t_frame in state['transition_frames']:
-                opacity_keyframes.append((t_frame, 0.0))
+            for t_frame in transition_frames:
+                opacity_keyframes.add((t_frame, 0.0))
                 fade_out_start = t_frame - fade_frames
                 if fade_out_start >= frame_start:
-                    opacity_keyframes.append((fade_out_start, 1.0))
+                    opacity_keyframes.add((fade_out_start, 1.0))
                 fade_in_end = t_frame + fade_frames
                 if fade_in_end <= frame_end:
-                    opacity_keyframes.append((fade_in_end, 1.0))
+                    opacity_keyframes.add((fade_in_end, 1.0))
 
-            # Sort and dedupe opacity keyframes
-            opacity_keyframes = sorted(set(opacity_keyframes))
+            for frame, opacity in sorted(opacity_keyframes):
+                keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
 
-            if opacity_keyframes:
-                fc_opacity = action.fcurves.new(data_path='["opacity"]', index=0)
-                fc_opacity.keyframe_points.add(len(opacity_keyframes))
-                for i, (frame, opacity) in enumerate(opacity_keyframes):
-                    fc_opacity.keyframe_points[i].co = (frame, opacity)
-                    fc_opacity.keyframe_points[i].interpolation = 'LINEAR'
-                fc_opacity.update()
-
-            # Set final property values on the object
-            if valid_frames:
-                last_data = valid_frames[-1][1]
-                hero_empty.location = last_data['location']
-                scale_val = max(last_data['size'], 0.01)
-                hero_empty.scale = (scale_val, scale_val, scale_val)
-                hero_empty['particle_index'] = last_data['index']
-                hero_empty['particle_distance'] = last_data['distance']
-                hero_empty['screen_x'] = last_data['screen_x']
-                hero_empty['screen_y'] = last_data['screen_y']
-                hero_empty['is_transition'] = 0
-                hero_empty['opacity'] = 1.0
+            # Set interpolation modes
+            if hero_empty.animation_data and hero_empty.animation_data.action:
+                for fcurve in hero_empty.animation_data.action.fcurves:
+                    if 'opacity' in fcurve.data_path:
+                        for keyframe in fcurve.keyframe_points:
+                            keyframe.interpolation = 'LINEAR'
+                    elif 'particle_index' in fcurve.data_path or 'is_transition' in fcurve.data_path:
+                        for keyframe in fcurve.keyframe_points:
+                            keyframe.interpolation = 'CONSTANT'
 
             results[suffix] = {
                 'frames_with_particle': frames_with_particle,
-                'transitions': len(state['transition_frames']),
+                'transitions': len(transition_frames),
             }
 
         # Restore original frame
@@ -1401,7 +1343,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v3.2.0 registered")
+    print("Hero Tracker v3.1.0 registered")
 
 
 def unregister():
