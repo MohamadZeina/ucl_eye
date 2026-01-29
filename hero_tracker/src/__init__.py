@@ -5,7 +5,10 @@ Finds the most prominent particle in camera view and tracks it with an empty.
 For each frame, identifies which particle from a named particle system is
 closest to the camera while being within the camera's view frustum.
 
-Custom properties baked on HeroEmpty:
+Supports dual-camera tracking (forward and backward) for seamless loop rendering.
+When both cameras are set, tracks are baked simultaneously for optimal performance.
+
+Custom properties baked on HeroEmpty_fw / HeroEmpty_bw:
 - particle_index: Which particle is currently tracked
 - opacity: Fades out/in during transitions (for text display)
 - particle_distance: Distance from camera to particle
@@ -15,23 +18,23 @@ Custom properties baked on HeroEmpty:
 Optional Text Display:
 - Enable "Text Display" in the panel and provide a CSV file path
 - CSV should have columns: cleaned_title, decoded_abstract
-- A "HeroText" text object will be created and updated each frame
+- HeroText_fw and HeroText_bw text objects will be created and updated each frame
 - Text shows the title and abstract of the currently tracked particle
 
 Usage:
 1. Name your particle system (e.g., "GalaxyParticles")
 2. Open the N-panel > Hero Tracker tab
 3. Enter the particle system name
-4. Select your camera
+4. Select your camera(s) - forward required, backward optional
 5. (Optional) Enable Text Display and select CSV file
 6. Click "Bake Hero Track"
-7. An empty called "HeroEmpty" will be keyframed to follow the most prominent particle
+7. Empties will be keyframed to follow the most prominent particle for each camera
 """
 
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (2, 0, 0),
+    "version": (3, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -177,42 +180,6 @@ def get_screen_radius(scene, camera, center, world_radius):
     return screen_radius, center_screen
 
 
-def calculate_view_opacity(screen_x, screen_y, screen_radius):
-    """
-    Calculate opacity based on how much of a particle is visible in frame.
-
-    Args:
-        screen_x, screen_y: Normalized screen coordinates of particle center (0-1)
-        screen_radius: Screen-space radius of particle in normalized coords
-
-    Returns:
-        Float 0-1: 0 = fully out of frame, 1 = fully in frame
-    """
-    if screen_radius <= 0:
-        screen_radius = 0.001  # Avoid division by zero
-
-    # Calculate how far the particle extends beyond each edge
-    # Positive values mean it's outside that edge
-    beyond_left = -screen_x + screen_radius      # How far past left edge (x=0)
-    beyond_right = screen_x + screen_radius - 1  # How far past right edge (x=1)
-    beyond_bottom = -screen_y + screen_radius    # How far past bottom edge (y=0)
-    beyond_top = screen_y + screen_radius - 1    # How far past top edge (y=1)
-
-    # Find the maximum overlap with any edge
-    max_beyond = max(beyond_left, beyond_right, beyond_bottom, beyond_top, 0)
-
-    # If center + radius is fully outside, opacity = 0
-    # Calculate what fraction of the diameter is still visible
-    diameter = screen_radius * 2
-    visible_fraction = max(0, diameter - max_beyond) / diameter
-
-    # Fully out of frame when max_beyond >= diameter
-    if max_beyond >= diameter:
-        return 0.0
-
-    return visible_fraction
-
-
 def find_most_prominent_particle(context, obj, psys_index, camera, margin, mode='CLOSEST'):
     """
     Find the most prominent particle within the camera's view frustum.
@@ -303,12 +270,17 @@ def find_most_prominent_particle(context, obj, psys_index, camera, margin, mode=
     return best
 
 
-def get_or_create_hero_empty(context):
+def get_or_create_hero_empty(context, suffix):
     """
-    Get or create the HeroEmpty object.
+    Get or create the HeroEmpty object with given suffix.
+
+    Args:
+        context: Blender context
+        suffix: String suffix like "_fw" or "_bw"
+
     Returns the empty object.
     """
-    hero_name = "HeroEmpty"
+    hero_name = f"HeroEmpty{suffix}"
 
     if hero_name in bpy.data.objects:
         return bpy.data.objects[hero_name]
@@ -400,12 +372,17 @@ def load_paper_csv(csv_path):
         return 0
 
 
-def get_or_create_hero_text(context):
+def get_or_create_hero_text(context, suffix):
     """
-    Get or create the HeroText text object.
+    Get or create the HeroText text object with given suffix.
+
+    Args:
+        context: Blender context
+        suffix: String suffix like "_fw" or "_bw"
+
     Returns the text object.
     """
-    text_name = "HeroText"
+    text_name = f"HeroText{suffix}"
 
     if text_name in bpy.data.objects:
         return bpy.data.objects[text_name]
@@ -424,17 +401,9 @@ def get_or_create_hero_text(context):
     return text_obj
 
 
-def update_hero_text(scene, depsgraph):
-    """
-    Frame change handler - updates HeroText based on current particle_index.
-    """
+def _update_text_for_hero(hero, text_obj):
+    """Helper to update a single text object from a hero empty."""
     global _paper_data
-
-    if not _paper_data:
-        return
-
-    hero = bpy.data.objects.get("HeroEmpty")
-    text_obj = bpy.data.objects.get("HeroText")
 
     if not hero or not text_obj:
         return
@@ -446,20 +415,35 @@ def update_hero_text(scene, depsgraph):
     paper = _paper_data.get(idx)
 
     if paper:
-        # Concatenate title and abstract, remove newlines
         title = paper.get('title', '')
         abstract = paper.get('abstract', '')
-
-        # Combine and clean up newlines/extra whitespace
-        combined = f"{title} — {abstract}"
+        combined = f"{title} - {abstract}"
         combined = combined.replace('\n', ' ').replace('\r', ' ')
-        # Collapse multiple spaces
         while '  ' in combined:
             combined = combined.replace('  ', ' ')
-
         text_obj.data.body = combined
     else:
         text_obj.data.body = f"No paper data for index {idx}"
+
+
+def update_hero_text(scene, depsgraph):
+    """
+    Frame change handler - updates HeroText_fw and HeroText_bw based on particle_index.
+    """
+    global _paper_data
+
+    if not _paper_data:
+        return
+
+    # Update forward text
+    hero_fw = bpy.data.objects.get("HeroEmpty_fw")
+    text_fw = bpy.data.objects.get("HeroText_fw")
+    _update_text_for_hero(hero_fw, text_fw)
+
+    # Update backward text
+    hero_bw = bpy.data.objects.get("HeroEmpty_bw")
+    text_bw = bpy.data.objects.get("HeroText_bw")
+    _update_text_for_hero(hero_bw, text_bw)
 
 
 def register_text_handler():
@@ -504,8 +488,8 @@ class HEROTRACKER_OT_bake(Operator):
             self.report({'ERROR'}, "Please enter a particle system name")
             return {'CANCELLED'}
 
-        if not props.camera:
-            self.report({'ERROR'}, "Please select a camera")
+        if not props.camera_fw and not props.camera_bw:
+            self.report({'ERROR'}, "Please select at least one camera")
             return {'CANCELLED'}
 
         # Find particle system
@@ -514,33 +498,45 @@ class HEROTRACKER_OT_bake(Operator):
             self.report({'ERROR'}, f"Particle system '{props.particle_system_name}' not found")
             return {'CANCELLED'}
 
-        camera = props.camera
+        # Determine which cameras to use
+        cameras = []
+        if props.camera_fw:
+            cameras.append(('_fw', props.camera_fw))
+        if props.camera_bw:
+            cameras.append(('_bw', props.camera_bw))
+
         view_margin = props.view_margin
         switch_margin = props.switch_margin
         selection_mode = props.selection_mode
         lookahead_frames = props.lookahead_frames
         fade_frames = props.fade_frames
 
-        # Get or create hero empty
-        hero_empty = get_or_create_hero_empty(context)
+        # Unregister text handler during bake - it fires on every frame_set()
+        # and writes to text objects, causing massive slowdown on subsequent bakes
+        text_handler_was_active = update_hero_text in bpy.app.handlers.frame_change_post
+        if text_handler_was_active:
+            bpy.app.handlers.frame_change_post.remove(update_hero_text)
 
-        # Clear existing animation data
-        if hero_empty.animation_data:
-            hero_empty.animation_data_clear()
-
-        # Initialize custom properties
-        initialize_custom_properties(hero_empty)
+        # Get or create hero empties and clear animation
+        hero_empties = {}
+        for suffix, camera in cameras:
+            hero_empty = get_or_create_hero_empty(context, suffix)
+            if hero_empty.animation_data:
+                hero_empty.animation_data_clear()
+            initialize_custom_properties(hero_empty)
+            hero_empties[suffix] = hero_empty
 
         # Get frame range
         frame_start = scene.frame_start
         frame_end = scene.frame_end
+        total_frames = frame_end - frame_start + 1
 
         # Store current frame to restore later
         original_frame = scene.frame_current
 
-        # Helper to get particle data at current frame (no frame_set)
-        def get_particle_data_at_current_frame(particle_index):
-            """Get particle data assuming scene is already at correct frame."""
+        # Helper to get particle data by index for a specific camera
+        def get_particle_by_index_for_camera(particle_index, camera):
+            """Get particle data for a specific particle index at current frame."""
             depsgraph = context.evaluated_depsgraph_get()
             obj_eval = obj.evaluated_get(depsgraph)
 
@@ -553,7 +549,6 @@ class HEROTRACKER_OT_bake(Operator):
             if particle_index < 0 or particle_index >= n_particles:
                 return None
 
-            # O(1) direct access to single particle
             particle = psys_eval.particles[particle_index]
             p_loc = Vector(particle.location)
             p_size = particle.size
@@ -561,7 +556,6 @@ class HEROTRACKER_OT_bake(Operator):
             cam_loc = camera.matrix_world.translation
             dist = (p_loc - cam_loc).length
 
-            # Get screen coords (use large margin to get coords even when off-screen)
             in_view, screen_coords, distance = is_point_in_camera_view(camera, p_loc, 0.5)
 
             if screen_coords is None:
@@ -576,34 +570,21 @@ class HEROTRACKER_OT_bake(Operator):
                 'screen_y': screen_coords.y,
             }
 
-        # Helper to get particle data at a specific frame (with frame_set)
-        def get_particle_by_index(frame, particle_index):
-            """Get particle data for a specific frame (sets frame first)."""
-            scene.frame_set(frame)
-            return get_particle_data_at_current_frame(particle_index)
-
-        def is_hero_out_of_frame(particle_data, margin):
+        def is_hero_out_of_frame(particle_data, camera, margin):
             """Check if hero particle is out of frame considering margin."""
             if particle_data is None:
                 return True
 
-            # Get screen-space radius
             screen_radius, _ = get_screen_radius(
                 scene, camera, particle_data['location'], particle_data['size']
             )
 
-            # Check if particle center + radius is outside frame with margin
             sx = particle_data['screen_x']
             sy = particle_data['screen_y']
 
-            # Frame boundaries considering margin
-            # Positive margin = larger frame (keep tracking longer, even when outside)
-            # Negative margin = smaller frame (switch sooner, even when still inside)
             lower = 0.0 - margin
             upper = 1.0 + margin
 
-            # Particle is out of frame when its center is beyond the margin-adjusted bounds
-            # plus its radius (so the whole particle is out)
             out_left = sx + screen_radius < lower
             out_right = sx - screen_radius > upper
             out_bottom = sy + screen_radius < lower
@@ -611,18 +592,23 @@ class HEROTRACKER_OT_bake(Operator):
 
             return out_left or out_right or out_bottom or out_top
 
-        # Single pass: find hero AND keyframe immediately (no redundant frame_set)
-        current_hero_idx = None
-        transition_frames = []
-        frames_with_particle = 0
-        frames_without_particle = 0
+        # Initialize tracking state for each camera
+        track_state = {}
+        for suffix, camera in cameras:
+            track_state[suffix] = {
+                'camera': camera,
+                'current_hero_idx': None,
+                'frame_heroes': [],  # (frame, idx, data)
+                'transition_frames': [],
+            }
 
-        total_frames = frame_end - frame_start + 1
-        print(f"Hero Tracker: Baking {total_frames} frames (optimized single-pass)...")
+        print(f"Hero Tracker: Baking {total_frames} frames for {len(cameras)} camera(s)...")
         bake_start_time = time.time()
 
+        # =====================================================================
+        # PASS 1: Single pass through all frames, process all cameras per frame
+        # =====================================================================
         for i, frame in enumerate(range(frame_start, frame_end + 1)):
-            # Progress printout every 10 frames or at start/end
             if i == 0 or (i + 1) % 10 == 0 or i == total_frames - 1:
                 pct = 100 * (i + 1) / total_frames
                 elapsed = time.time() - bake_start_time
@@ -631,144 +617,162 @@ class HEROTRACKER_OT_bake(Operator):
                     eta_str = f", ETA: {eta:.0f}s" if eta >= 1 else ", ETA: <1s"
                 else:
                     eta_str = ""
-                print(f"  Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
+                print(f"  Pass 1/2: Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
 
-            scene.frame_set(frame)  # Only ONE frame_set per frame (plus lookahead if needed)
+            scene.frame_set(frame)
 
-            # Check if current hero is still valid (in frame)
-            need_new_hero = False
-            hero_data = None
+            # Process each camera at this frame
+            for suffix, camera in cameras:
+                state = track_state[suffix]
+                current_hero_idx = state['current_hero_idx']
 
-            if current_hero_idx is not None:
-                # Use optimized version - no redundant frame_set
-                hero_data = get_particle_data_at_current_frame(current_hero_idx)
-                if is_hero_out_of_frame(hero_data, switch_margin):
+                # Check if current hero is still valid
+                need_new_hero = False
+                current_hero_data = None
+
+                if current_hero_idx is not None:
+                    current_hero_data = get_particle_by_index_for_camera(current_hero_idx, camera)
+                    if is_hero_out_of_frame(current_hero_data, camera, switch_margin):
+                        need_new_hero = True
+                else:
                     need_new_hero = True
-            else:
-                need_new_hero = True
 
-            if need_new_hero:
-                # Find best new hero - look ahead to find particle that will be prominent
-                if lookahead_frames > 0:
-                    future_frame = min(frame + lookahead_frames, frame_end)
-                    scene.frame_set(future_frame)
-                    new_hero_future = find_most_prominent_particle(
-                        context, obj, psys_idx, camera, view_margin, selection_mode
-                    )
-                    scene.frame_set(frame)  # Return to current frame
-
-                    if new_hero_future is not None:
-                        # Get this particle's data at current frame - no redundant frame_set
-                        hero_data = get_particle_data_at_current_frame(new_hero_future['index'])
-                    else:
-                        hero_data = find_most_prominent_particle(
+                if need_new_hero:
+                    # Find best new hero
+                    if lookahead_frames > 0:
+                        future_frame = min(frame + lookahead_frames, frame_end)
+                        scene.frame_set(future_frame)
+                        new_hero_future = find_most_prominent_particle(
                             context, obj, psys_idx, camera, view_margin, selection_mode
                         )
-                else:
-                    hero_data = find_most_prominent_particle(
-                        context, obj, psys_idx, camera, view_margin, selection_mode
-                    )
+                        scene.frame_set(frame)
 
+                        if new_hero_future is not None:
+                            new_hero = get_particle_by_index_for_camera(new_hero_future['index'], camera)
+                        else:
+                            new_hero = find_most_prominent_particle(
+                                context, obj, psys_idx, camera, view_margin, selection_mode
+                            )
+                    else:
+                        new_hero = find_most_prominent_particle(
+                            context, obj, psys_idx, camera, view_margin, selection_mode
+                        )
+
+                    if new_hero is not None:
+                        if current_hero_idx is not None and new_hero['index'] != current_hero_idx:
+                            state['transition_frames'].append(frame)
+                        state['current_hero_idx'] = new_hero['index']
+                        state['frame_heroes'].append((frame, new_hero['index'], new_hero))
+                    else:
+                        state['frame_heroes'].append((frame, None, None))
+                        state['current_hero_idx'] = None
+                else:
+                    state['frame_heroes'].append((frame, current_hero_idx, current_hero_data))
+
+        pass1_time = time.time() - bake_start_time
+        print(f"  Pass 1 complete in {pass1_time:.1f}s")
+
+        # =====================================================================
+        # PASS 2: Keyframe all empties from cached data
+        # =====================================================================
+        pass2_start_time = time.time()
+        print(f"  Pass 2/2: Baking keyframes...")
+
+        results = {}
+        for suffix, camera in cameras:
+            state = track_state[suffix]
+            hero_empty = hero_empties[suffix]
+            frame_heroes = state['frame_heroes']
+            transition_frames = state['transition_frames']
+
+            frames_with_particle = 0
+            frames_without_particle = 0
+
+            for j, (frame, hero_idx, hero_data) in enumerate(frame_heroes):
                 if hero_data is not None:
-                    if current_hero_idx is not None and hero_data['index'] != current_hero_idx:
-                        transition_frames.append(frame)
-                    current_hero_idx = hero_data['index']
+                    hero_empty.location = hero_data['location']
+                    hero_empty.keyframe_insert(data_path="location", frame=frame)
+
+                    scale_val = max(hero_data['size'], 0.01)
+                    hero_empty.scale = (scale_val, scale_val, scale_val)
+                    hero_empty.keyframe_insert(data_path="scale", frame=frame)
+
+                    keyframe_custom_property(hero_empty, 'particle_index', hero_data['index'], frame)
+                    keyframe_custom_property(hero_empty, 'particle_distance', hero_data['distance'], frame)
+                    keyframe_custom_property(hero_empty, 'screen_x', hero_data['screen_x'], frame)
+                    keyframe_custom_property(hero_empty, 'screen_y', hero_data['screen_y'], frame)
+
+                    is_trans = 1 if frame in transition_frames else 0
+                    keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
+
+                    frames_with_particle += 1
                 else:
-                    current_hero_idx = None
+                    frames_without_particle += 1
 
-            # Keyframe immediately while we're at this frame (no separate pass needed)
-            if hero_data is not None:
-                hero_empty.location = hero_data['location']
-                hero_empty.keyframe_insert(data_path="location", frame=frame)
+            # Keyframe opacity at transition points
+            opacity_keyframes = set()
+            if frames_with_particle > 0:
+                opacity_keyframes.add((frame_start, 1.0))
+                opacity_keyframes.add((frame_end, 1.0))
 
-                scale_val = max(hero_data['size'], 0.01)
-                hero_empty.scale = (scale_val, scale_val, scale_val)
-                hero_empty.keyframe_insert(data_path="scale", frame=frame)
+            for t_frame in transition_frames:
+                opacity_keyframes.add((t_frame, 0.0))
+                fade_out_start = t_frame - fade_frames
+                if fade_out_start >= frame_start:
+                    opacity_keyframes.add((fade_out_start, 1.0))
+                fade_in_end = t_frame + fade_frames
+                if fade_in_end <= frame_end:
+                    opacity_keyframes.add((fade_in_end, 1.0))
 
-                keyframe_custom_property(hero_empty, 'particle_index', hero_data['index'], frame)
-                keyframe_custom_property(hero_empty, 'particle_distance', hero_data['distance'], frame)
-                keyframe_custom_property(hero_empty, 'screen_x', hero_data['screen_x'], frame)
-                keyframe_custom_property(hero_empty, 'screen_y', hero_data['screen_y'], frame)
+            for frame, opacity in sorted(opacity_keyframes):
+                keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
 
-                # is_transition - we know this immediately
-                is_trans = 1 if frame in transition_frames else 0
-                keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
+            # Set interpolation modes
+            if hero_empty.animation_data and hero_empty.animation_data.action:
+                for fcurve in hero_empty.animation_data.action.fcurves:
+                    if 'opacity' in fcurve.data_path:
+                        for keyframe in fcurve.keyframe_points:
+                            keyframe.interpolation = 'LINEAR'
+                    elif 'particle_index' in fcurve.data_path or 'is_transition' in fcurve.data_path:
+                        for keyframe in fcurve.keyframe_points:
+                            keyframe.interpolation = 'CONSTANT'
 
-                frames_with_particle += 1
-            else:
-                frames_without_particle += 1
-
-        main_pass_time = time.time() - bake_start_time
-        print(f"  Main pass complete in {main_pass_time:.1f}s")
-
-        # Opacity keyframes at transition points only (no frame_set needed)
-        # This allows Blender's interpolation to create smooth fades
-        # At transition frame T: opacity=0
-        # At T-N and T+N: opacity=1
-        opacity_keyframes = set()  # Track which frames get opacity keyframes
-
-        # Always keyframe opacity=1 at start and end
-        if frames_with_particle > 0:
-            opacity_keyframes.add((frame_start, 1.0))
-            opacity_keyframes.add((frame_end, 1.0))
-
-        # For each transition, add keyframes
-        for t_frame in transition_frames:
-            # Keyframe at transition: opacity=0
-            opacity_keyframes.add((t_frame, 0.0))
-
-            # Keyframe N frames before: opacity=1 (start of fade out)
-            fade_out_start = t_frame - fade_frames
-            if fade_out_start >= frame_start:
-                opacity_keyframes.add((fade_out_start, 1.0))
-
-            # Keyframe N frames after: opacity=1 (end of fade in)
-            fade_in_end = t_frame + fade_frames
-            if fade_in_end <= frame_end:
-                opacity_keyframes.add((fade_in_end, 1.0))
-
-        # Apply opacity keyframes (sorted by frame for clean processing)
-        for frame, opacity in sorted(opacity_keyframes):
-            keyframe_custom_property(hero_empty, 'opacity', opacity, frame)
-
-        # Set interpolation modes
-        if hero_empty.animation_data and hero_empty.animation_data.action:
-            for fcurve in hero_empty.animation_data.action.fcurves:
-                if 'opacity' in fcurve.data_path:
-                    for keyframe in fcurve.keyframe_points:
-                        keyframe.interpolation = 'LINEAR'
-                # Use constant interpolation for particle_index (discrete values)
-                elif 'particle_index' in fcurve.data_path or 'is_transition' in fcurve.data_path:
-                    for keyframe in fcurve.keyframe_points:
-                        keyframe.interpolation = 'CONSTANT'
+            results[suffix] = {
+                'frames_with_particle': frames_with_particle,
+                'transitions': len(transition_frames),
+            }
 
         # Restore original frame
         scene.frame_set(original_frame)
 
+        pass2_time = time.time() - pass2_start_time
         total_time = time.time() - bake_start_time
-        print(f"Hero Tracker: Bake complete in {total_time:.1f}s. {len(transition_frames)} transitions found.")
+        print(f"  Pass 2 complete in {pass2_time:.1f}s")
+
+        # Build results summary
+        results_str = ", ".join([f"{s}: {r['transitions']} trans" for s, r in results.items()])
+        print(f"Hero Tracker: Bake complete in {total_time:.1f}s. {results_str}")
 
         # Set up text display if enabled
         text_info = ""
         if props.enable_text_display and props.csv_file_path:
             num_papers = load_paper_csv(props.csv_file_path)
             if num_papers > 0:
-                get_or_create_hero_text(context)
+                for suffix, camera in cameras:
+                    get_or_create_hero_text(context, suffix)
                 register_text_handler()
-                # Trigger initial text update
                 update_hero_text(scene, context.evaluated_depsgraph_get())
-                text_info = f" Text display: {num_papers} papers loaded."
+                text_info = f" Text: {num_papers} papers."
             else:
                 self.report({'WARNING'}, f"Could not load CSV: {props.csv_file_path}")
 
         # Report results
         mode_name = "closest" if selection_mode == 'CLOSEST' else "largest on screen"
-        lookahead_info = f", {lookahead_frames}f lookahead" if lookahead_frames > 0 else ""
-        fade_info = f", {fade_frames}f fade"
+        cam_info = f"{len(cameras)} cam" if len(cameras) > 1 else "1 cam"
+        total_trans = sum(r['transitions'] for r in results.values())
         self.report(
             {'INFO'},
-            f"Baked {frames_with_particle}/{total_frames} frames ({mode_name}{lookahead_info}{fade_info}). "
-            f"{len(transition_frames)} transitions.{text_info}"
+            f"Baked {total_frames}f x {cam_info} ({mode_name}). {total_trans} transitions.{text_info}"
         )
 
         return {'FINISHED'}
@@ -784,12 +788,14 @@ class HEROTRACKER_OT_clear(Operator):
         global _paper_data
         cleared_items = []
 
-        hero_name = "HeroEmpty"
-        if hero_name in bpy.data.objects:
-            hero = bpy.data.objects[hero_name]
-            if hero.animation_data:
-                hero.animation_data_clear()
-                cleared_items.append("animation")
+        # Clear both fw and bw empties
+        for suffix in ['_fw', '_bw']:
+            hero_name = f"HeroEmpty{suffix}"
+            if hero_name in bpy.data.objects:
+                hero = bpy.data.objects[hero_name]
+                if hero.animation_data:
+                    hero.animation_data_clear()
+                    cleared_items.append(f"HeroEmpty{suffix}")
 
         # Unregister text handler
         if update_hero_text in bpy.app.handlers.frame_change_post:
@@ -818,96 +824,90 @@ class HEROTRACKER_OT_bake_rotation(Operator):
     def execute(self, context):
         props = context.scene.hero_tracker
 
-        # Check if HeroEmpty exists
-        hero_name = "HeroEmpty"
-        if hero_name not in bpy.data.objects:
-            self.report({'ERROR'}, "HeroEmpty not found. Bake hero track first.")
+        # Find hero empties
+        empties_to_process = []
+        for suffix in ['_fw', '_bw']:
+            hero_name = f"HeroEmpty{suffix}"
+            if hero_name in bpy.data.objects:
+                hero = bpy.data.objects[hero_name]
+                if hero.animation_data and hero.animation_data.action:
+                    empties_to_process.append((suffix, hero))
+
+        if not empties_to_process:
+            self.report({'ERROR'}, "No animated HeroEmpty found. Bake hero track first.")
             return {'CANCELLED'}
-
-        hero_empty = bpy.data.objects[hero_name]
-
-        # Check if it has animation data with particle_index
-        if not hero_empty.animation_data or not hero_empty.animation_data.action:
-            self.report({'ERROR'}, "HeroEmpty has no animation. Bake hero track first.")
-            return {'CANCELLED'}
-
-        action = hero_empty.animation_data.action
-
-        # Find the particle_index F-curve
-        particle_index_fcurve = None
-        for fcurve in action.fcurves:
-            if fcurve.data_path == '["particle_index"]':
-                particle_index_fcurve = fcurve
-                break
-
-        if particle_index_fcurve is None:
-            self.report({'ERROR'}, "No particle_index keyframes found. Bake hero track first.")
-            return {'CANCELLED'}
-
-        # Find transition frames (where particle_index changes)
-        keyframes = particle_index_fcurve.keyframe_points
-        if len(keyframes) < 2:
-            self.report({'WARNING'}, "Not enough keyframes to detect transitions.")
-            return {'CANCELLED'}
-
-        transition_frames = []
-        prev_value = None
-        first_frame = None
-        last_frame = None
-
-        for kf in keyframes:
-            frame = int(kf.co[0])
-            value = int(kf.co[1])
-
-            if first_frame is None:
-                first_frame = frame
-            last_frame = frame
-
-            if prev_value is not None and value != prev_value:
-                transition_frames.append(frame)
-            prev_value = value
 
         # Set up random seed
         if props.rotation_seed != 0:
             random.seed(props.rotation_seed)
         else:
-            random.seed()  # Use system time
+            random.seed()
 
         stddev_rad = math.radians(props.rotation_stddev)
+        total_keyframes = 0
 
-        # Clear existing rotation keyframes
-        rotation_paths = ['rotation_euler']
-        for fcurve in list(action.fcurves):
-            if fcurve.data_path in rotation_paths:
-                action.fcurves.remove(fcurve)
+        for suffix, hero_empty in empties_to_process:
+            action = hero_empty.animation_data.action
 
-        # Ensure rotation mode is Euler
-        hero_empty.rotation_mode = 'XYZ'
+            # Find the particle_index F-curve
+            particle_index_fcurve = None
+            for fcurve in action.fcurves:
+                if fcurve.data_path == '["particle_index"]':
+                    particle_index_fcurve = fcurve
+                    break
 
-        # Generate rotation keyframes
-        # Start with a random rotation at the first frame
-        all_rotation_frames = [first_frame] + transition_frames
+            if particle_index_fcurve is None:
+                continue
 
-        for frame in all_rotation_frames:
-            rot_x = random.gauss(0, stddev_rad)
-            rot_y = random.gauss(0, stddev_rad)
-            rot_z = random.gauss(0, stddev_rad)
+            # Find transition frames
+            keyframes = particle_index_fcurve.keyframe_points
+            if len(keyframes) < 2:
+                continue
 
-            hero_empty.rotation_euler = (rot_x, rot_y, rot_z)
-            hero_empty.keyframe_insert(data_path="rotation_euler", frame=frame)
+            transition_frames = []
+            prev_value = None
+            first_frame = None
 
-        # Set interpolation to smooth (Bezier) for nice transitions
-        for fcurve in action.fcurves:
-            if fcurve.data_path == 'rotation_euler':
-                for keyframe in fcurve.keyframe_points:
-                    keyframe.interpolation = 'BEZIER'
-                    keyframe.handle_left_type = 'AUTO_CLAMPED'
-                    keyframe.handle_right_type = 'AUTO_CLAMPED'
+            for kf in keyframes:
+                frame = int(kf.co[0])
+                value = int(kf.co[1])
+
+                if first_frame is None:
+                    first_frame = frame
+
+                if prev_value is not None and value != prev_value:
+                    transition_frames.append(frame)
+                prev_value = value
+
+            # Clear existing rotation keyframes
+            for fcurve in list(action.fcurves):
+                if fcurve.data_path == 'rotation_euler':
+                    action.fcurves.remove(fcurve)
+
+            hero_empty.rotation_mode = 'XYZ'
+
+            all_rotation_frames = [first_frame] + transition_frames
+
+            for frame in all_rotation_frames:
+                rot_x = random.gauss(0, stddev_rad)
+                rot_y = random.gauss(0, stddev_rad)
+                rot_z = random.gauss(0, stddev_rad)
+
+                hero_empty.rotation_euler = (rot_x, rot_y, rot_z)
+                hero_empty.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+            for fcurve in action.fcurves:
+                if fcurve.data_path == 'rotation_euler':
+                    for keyframe in fcurve.keyframe_points:
+                        keyframe.interpolation = 'BEZIER'
+                        keyframe.handle_left_type = 'AUTO_CLAMPED'
+                        keyframe.handle_right_type = 'AUTO_CLAMPED'
+
+            total_keyframes += len(all_rotation_frames)
 
         self.report(
             {'INFO'},
-            f"Baked rotation: {len(all_rotation_frames)} keyframes "
-            f"(stddev={props.rotation_stddev}°, seed={props.rotation_seed or 'random'})"
+            f"Baked rotation: {total_keyframes} keyframes across {len(empties_to_process)} empty(s)"
         )
 
         return {'FINISHED'}
@@ -923,21 +923,16 @@ class HEROTRACKER_OT_export_titles(Operator):
         global _paper_data
         props = context.scene.hero_tracker
 
-        # Validate HeroEmpty exists with animation
-        hero = bpy.data.objects.get("HeroEmpty")
-        if not hero or not hero.animation_data or not hero.animation_data.action:
-            self.report({'ERROR'}, "HeroEmpty not found or has no animation. Bake first.")
-            return {'CANCELLED'}
+        # Find hero empties with animation
+        empties_to_export = []
+        for suffix in ['_fw', '_bw']:
+            hero_name = f"HeroEmpty{suffix}"
+            hero = bpy.data.objects.get(hero_name)
+            if hero and hero.animation_data and hero.animation_data.action:
+                empties_to_export.append((suffix, hero))
 
-        # Find particle_index F-curve
-        fcurve = None
-        for fc in hero.animation_data.action.fcurves:
-            if fc.data_path == '["particle_index"]':
-                fcurve = fc
-                break
-
-        if not fcurve or len(fcurve.keyframe_points) == 0:
-            self.report({'ERROR'}, "No particle_index keyframes found.")
+        if not empties_to_export:
+            self.report({'ERROR'}, "No animated HeroEmpty found. Bake first.")
             return {'CANCELLED'}
 
         # Ensure CSV data is loaded
@@ -949,46 +944,58 @@ class HEROTRACKER_OT_export_titles(Operator):
                 self.report({'ERROR'}, f"Failed to load CSV: {props.csv_file_path}")
                 return {'CANCELLED'}
 
-        # Extract hero segments from keyframes (CONSTANT interpolation = value until next keyframe)
-        segments = []
-        prev_idx, start_frame = None, None
+        all_lines = ["HERO TRACKER - TITLE EXPORT", "=" * 50, ""]
+        total_unique = 0
 
-        for kf in fcurve.keyframe_points:
-            frame, idx = int(kf.co[0]), int(kf.co[1])
-            if idx != prev_idx:
-                if prev_idx is not None and prev_idx >= 0:
-                    segments.append((start_frame, frame - 1, prev_idx))
-                prev_idx, start_frame = idx, frame
+        for suffix, hero in empties_to_export:
+            fcurve = None
+            for fc in hero.animation_data.action.fcurves:
+                if fc.data_path == '["particle_index"]':
+                    fcurve = fc
+                    break
 
-        # Final segment
-        if prev_idx is not None and prev_idx >= 0:
-            segments.append((start_frame, int(fcurve.keyframe_points[-1].co[0]), prev_idx))
+            if not fcurve or len(fcurve.keyframe_points) == 0:
+                continue
 
-        # Build output
-        lines = ["HERO TRACKER - TITLE EXPORT", "=" * 50, ""]
-        seen, unique_titles = set(), []
+            all_lines.append(f"Track: HeroEmpty{suffix}")
+            all_lines.append("-" * 30)
 
-        for start, end, idx in segments:
-            paper = _paper_data.get(idx, {})
-            title = paper.get('title', f'[No data for particle {idx}]')
-            lines.append(f"Frames {start}-{end} | Particle {idx}")
-            lines.append(f"  {title}")
-            lines.append("")
-            if idx not in seen:
-                seen.add(idx)
-                unique_titles.append((idx, title))
+            segments = []
+            prev_idx, start_frame = None, None
 
-        lines.extend(["=" * 50, f"SUMMARY: {len(segments)} segments, {len(unique_titles)} unique heroes", "", "UNIQUE TITLES:"])
-        for i, (idx, title) in enumerate(unique_titles, 1):
-            lines.append(f"  {i}. [P{idx}] {title}")
+            for kf in fcurve.keyframe_points:
+                frame, idx = int(kf.co[0]), int(kf.co[1])
+                if idx != prev_idx:
+                    if prev_idx is not None and prev_idx >= 0:
+                        segments.append((start_frame, frame - 1, prev_idx))
+                    prev_idx, start_frame = idx, frame
+
+            if prev_idx is not None and prev_idx >= 0:
+                segments.append((start_frame, int(fcurve.keyframe_points[-1].co[0]), prev_idx))
+
+            seen, unique_titles = set(), []
+
+            for start, end, idx in segments:
+                paper = _paper_data.get(idx, {})
+                title = paper.get('title', f'[No data for particle {idx}]')
+                all_lines.append(f"Frames {start}-{end} | Particle {idx}")
+                all_lines.append(f"  {title}")
+                all_lines.append("")
+                if idx not in seen:
+                    seen.add(idx)
+                    unique_titles.append((idx, title))
+
+            all_lines.append(f"Unique heroes: {len(unique_titles)}")
+            all_lines.append("")
+            total_unique += len(unique_titles)
 
         # Write to text block
         text_name = "HeroTitles"
         text = bpy.data.texts.get(text_name) or bpy.data.texts.new(text_name)
         text.clear()
-        text.write("\n".join(lines))
+        text.write("\n".join(all_lines))
 
-        self.report({'INFO'}, f"Exported {len(unique_titles)} unique heroes to '{text_name}'")
+        self.report({'INFO'}, f"Exported {total_unique} unique heroes to '{text_name}'")
         return {'FINISHED'}
 
 
@@ -1003,9 +1010,16 @@ class HeroTrackerProperties(PropertyGroup):
         default="ParticleSystem"
     )
 
-    camera: PointerProperty(
-        name="Camera",
-        description="Camera to use for view frustum calculations",
+    camera_fw: PointerProperty(
+        name="Camera (Forward)",
+        description="Forward camera for hero tracking",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CAMERA'
+    )
+
+    camera_bw: PointerProperty(
+        name="Camera (Backward)",
+        description="Backward camera for hero tracking (optional - for seamless loops)",
         type=bpy.types.Object,
         poll=lambda self, obj: obj.type == 'CAMERA'
     )
@@ -1076,7 +1090,7 @@ class HeroTrackerProperties(PropertyGroup):
     enable_text_display: BoolProperty(
         name="Enable Text Display",
         description=(
-            "Create a text object that displays the title and abstract "
+            "Create text objects that display the title and abstract "
             "of the currently tracked particle from a CSV file"
         ),
         default=False
@@ -1135,7 +1149,19 @@ class HEROTRACKER_PT_main(Panel):
         box = layout.box()
         box.label(text="Settings", icon='SETTINGS')
         box.prop(props, "particle_system_name", icon='PARTICLES')
-        box.prop(props, "camera", icon='CAMERA_DATA')
+        box.prop(props, "camera_fw", icon='CAMERA_DATA')
+        box.prop(props, "camera_bw", icon='CAMERA_DATA')
+
+        # Show camera status
+        if props.camera_fw and props.camera_bw:
+            box.label(text="Dual camera mode (fw + bw)", icon='CHECKMARK')
+        elif props.camera_fw:
+            box.label(text="Forward camera only", icon='INFO')
+        elif props.camera_bw:
+            box.label(text="Backward camera only", icon='INFO')
+        else:
+            box.label(text="No camera selected", icon='ERROR')
+
         box.prop(props, "selection_mode")
 
         # Lookahead & Transitions
@@ -1145,26 +1171,12 @@ class HEROTRACKER_PT_main(Panel):
         if props.lookahead_frames > 0:
             box.label(text=f"Pick hero prominent in {props.lookahead_frames}f", icon='INFO')
         box.prop(props, "fade_frames")
-        box.label(text=f"Fade: {props.fade_frames}f out → 0 → {props.fade_frames}f in", icon='INFO')
 
         # Margins
         box.separator()
         box.label(text="Margins:", icon='FULLSCREEN_ENTER')
         box.prop(props, "view_margin")
         box.prop(props, "switch_margin")
-
-        # Info about margins
-        if props.view_margin != 0:
-            if props.view_margin > 0:
-                box.label(text=f"Candidates: +{props.view_margin*100:.0f}% outside", icon='INFO')
-            else:
-                box.label(text=f"Candidates: -{abs(props.view_margin)*100:.0f}% at edges", icon='INFO')
-
-        if props.switch_margin != 0:
-            if props.switch_margin > 0:
-                box.label(text=f"Switch: +{props.switch_margin*100:.0f}% outside", icon='INFO')
-            else:
-                box.label(text=f"Switch: -{abs(props.switch_margin)*100:.0f}% inside", icon='INFO')
 
         # Text Display (optional)
         layout.separator()
@@ -1174,23 +1186,20 @@ class HEROTRACKER_PT_main(Panel):
 
         if props.enable_text_display:
             box.prop(props, "csv_file_path")
-            # Show status of text display
             if _paper_data:
                 box.label(text=f"Loaded: {len(_paper_data)} papers", icon='CHECKMARK')
             elif props.csv_file_path:
                 box.label(text="CSV not loaded (bake to load)", icon='INFO')
 
-            if "HeroText" in bpy.data.objects:
-                box.label(text="HeroText: Created", icon='CHECKMARK')
-            else:
-                box.label(text="HeroText: Not created", icon='DOT')
+            # Show text object status
+            for suffix in ['_fw', '_bw']:
+                text_name = f"HeroText{suffix}"
+                if text_name in bpy.data.objects:
+                    box.label(text=f"{text_name}: Created", icon='CHECKMARK')
 
             if update_hero_text in bpy.app.handlers.frame_change_post:
                 box.label(text="Handler: Active", icon='CHECKMARK')
-            else:
-                box.label(text="Handler: Inactive", icon='DOT')
 
-            # Export titles button
             box.separator()
             box.operator("herotracker.export_titles", icon='TEXT')
 
@@ -1231,21 +1240,18 @@ class HEROTRACKER_PT_main(Panel):
         else:
             box.label(text="Particle system not found", icon='ERROR')
 
-        # Check if HeroEmpty exists and show custom properties
-        if "HeroEmpty" in bpy.data.objects:
-            hero = bpy.data.objects["HeroEmpty"]
-            has_anim = hero.animation_data is not None and hero.animation_data.action is not None
-            if has_anim:
-                box.label(text="HeroEmpty: Animated", icon='CHECKMARK')
-                # Show current custom property values
-                if "particle_index" in hero:
-                    box.label(text=f"  Index: {hero['particle_index']}")
-                if "opacity" in hero:
-                    box.label(text=f"  Opacity: {hero['opacity']:.2f}")
-            else:
-                box.label(text="HeroEmpty: No animation", icon='DOT')
-        else:
-            box.label(text="HeroEmpty: Not created", icon='DOT')
+        # Check hero empties
+        for suffix in ['_fw', '_bw']:
+            hero_name = f"HeroEmpty{suffix}"
+            if hero_name in bpy.data.objects:
+                hero = bpy.data.objects[hero_name]
+                has_anim = hero.animation_data is not None and hero.animation_data.action is not None
+                if has_anim:
+                    box.label(text=f"{hero_name}: Animated", icon='CHECKMARK')
+                    if "particle_index" in hero:
+                        box.label(text=f"  Index: {hero['particle_index']}")
+                else:
+                    box.label(text=f"{hero_name}: No animation", icon='DOT')
 
 
 # =============================================================================
@@ -1267,7 +1273,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v2.0.0 registered")
+    print("Hero Tracker v3.0.0 registered")
 
 
 def unregister():
