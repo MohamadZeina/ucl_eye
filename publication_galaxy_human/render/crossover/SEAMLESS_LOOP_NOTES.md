@@ -75,13 +75,22 @@ Output Video:
 
 The crossover FRAME being close to the meeting point helps one side of the splice, but the backward sequence still starts one step away.
 
-### Issue 3: Camera Tracking Point Drift
+### Issue 3: Camera Tracking Point (Static vs Moving)
 
-**Symptom**: Subtle artefacts even when camera positions match.
+**Initial symptom**: Severe artefacts at crossover points even when camera positions should match.
 
-**Cause**: The camera's "track to" target was subtly changing during the animation, causing slight framing differences between forward and backward passes.
+**Original setup**:
+- Forward camera tracks to a "forward empty" orbiting a small circle
+- Backward camera tracks to a "backward empty" orbiting the same small circle in reverse
+- Both empties should meet at the same points as the cameras (0%, 50%)
 
-**Solution**: Lock the camera tracking to a static point. This dramatically improved the crossover smoothness ("1000 times better").
+**Initial hypothesis**: Moving empties compound the visual discontinuity because at the splice point, not only are the cameras offset from the meeting point, but the look-targets are also offset in the same direction, roughly doubling the viewing angle difference.
+
+**Testing revealed**: When switched to a static tracking point, crossovers became "1000 times better" - nearly flawless.
+
+**However**: Further testing with corrected implementation showed moving focus points can also work flawlessly. The original issue may have been an implementation bug (e.g., cameras looking at wrong empties) rather than a fundamental problem with the technique.
+
+**Current status**: Both static and moving focus points appear to work when implemented correctly. Static is simpler and guaranteed to work; moving focus requires careful setup but can provide subtle parallax effects.
 
 ### Issue 4: Stale Output Files
 
@@ -120,8 +129,34 @@ python3 stitch_loop.py fw_dir bw_dir output_dir --no-skip-crossover
 |-------|------|---------|----------|-------|
 | `*_25step_reference_v2_*` | 25 | Evolved | Dynamic | Smoothest step size |
 | `*_500step_reference_only_v2_*` | 500 | Static | Dynamic | Reference particles only |
-| `*_500step_static_track_*` | 500 | Static | Static | Best crossover quality |
-| `*_500step_evolved_static_track_*` | 500 | Evolved | Static | Full simulation, static tracking |
+| `*_500step_static_track_*` | 500 | Static | Static | Reference only, static focus |
+| `*_500step_evolved_static_track_*` | 500 | Evolved | Static | Full simulation, static focus |
+| `*_500step_static_track_large_ref_*` | 500 | Evolved | Static | Large reference particles, static focus |
+| `*_500step_static_track_large_ref_only_*` | 500 | Static | Static | Large reference only, static focus |
+| `*_500step_moving_focus_large_ref_only_*` | 500 | Static | Moving | Large reference only, moving focus |
+| `*_500step_moving_focus_evolved_large_ref_*` | 500 | Evolved | Moving | Full simulation, moving focus |
+| `*_500step_try_repro_*` | 500 | Evolved | Moving | Reproduction test for moving focus |
+
+## Phase Offset for Crossover Position
+
+To change where on the orbit the crossover happens (without changing which simulation frames are used), add a phase offset to the camera driver:
+
+```
+# Original (crossover at 0% and 50% of orbit visually)
+100 * (frame / 60000)
+
+# With 90° phase offset (crossover at 25% and 75% of orbit visually)
+100 * ((frame + 15000) / 60000)
+
+# General formula
+100 * ((frame + offset) / 60000)
+```
+
+Apply the same offset to both cameras:
+- Forward: `100 * ((frame + offset) / 60000)`
+- Backward: `100 * (-(frame + offset) / 60000)`
+
+The cameras still meet at the same simulation frames (0, 30000, 60000), but the visual position on the orbit where they meet shifts by `offset/60000 * 360°`.
 
 ## Future Improvements
 
