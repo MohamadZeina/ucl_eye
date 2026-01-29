@@ -31,7 +31,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (1, 11, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -538,10 +538,9 @@ class HEROTRACKER_OT_bake(Operator):
         # Store current frame to restore later
         original_frame = scene.frame_current
 
-        # Helper to get particle data by index - O(1) single particle access
-        def get_particle_by_index(frame, particle_index):
-            """Get particle data for a specific particle index at a given frame."""
-            scene.frame_set(frame)
+        # Helper to get particle data at current frame (no frame_set)
+        def get_particle_data_at_current_frame(particle_index):
+            """Get particle data assuming scene is already at correct frame."""
             depsgraph = context.evaluated_depsgraph_get()
             obj_eval = obj.evaluated_get(depsgraph)
 
@@ -577,6 +576,12 @@ class HEROTRACKER_OT_bake(Operator):
                 'screen_y': screen_coords.y,
             }
 
+        # Helper to get particle data at a specific frame (with frame_set)
+        def get_particle_by_index(frame, particle_index):
+            """Get particle data for a specific frame (sets frame first)."""
+            scene.frame_set(frame)
+            return get_particle_data_at_current_frame(particle_index)
+
         def is_hero_out_of_frame(particle_data, margin):
             """Check if hero particle is out of frame considering margin."""
             if particle_data is None:
@@ -606,13 +611,14 @@ class HEROTRACKER_OT_bake(Operator):
 
             return out_left or out_right or out_bottom or out_top
 
-        # First pass: determine hero for each frame using sticky selection
-        frame_heroes = []  # List of (frame, particle_index, particle_data)
+        # Single pass: find hero AND keyframe immediately (no redundant frame_set)
         current_hero_idx = None
         transition_frames = []
+        frames_with_particle = 0
+        frames_without_particle = 0
 
         total_frames = frame_end - frame_start + 1
-        print(f"Hero Tracker: Baking {total_frames} frames...")
+        print(f"Hero Tracker: Baking {total_frames} frames (optimized single-pass)...")
         bake_start_time = time.time()
 
         for i, frame in enumerate(range(frame_start, frame_end + 1)):
@@ -625,108 +631,77 @@ class HEROTRACKER_OT_bake(Operator):
                     eta_str = f", ETA: {eta:.0f}s" if eta >= 1 else ", ETA: <1s"
                 else:
                     eta_str = ""
-                print(f"  Pass 1/2: Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
+                print(f"  Frame {frame} ({i + 1}/{total_frames}) - {pct:.1f}%{eta_str}")
 
-            scene.frame_set(frame)
+            scene.frame_set(frame)  # Only ONE frame_set per frame (plus lookahead if needed)
 
             # Check if current hero is still valid (in frame)
             need_new_hero = False
-            current_hero_data = None
+            hero_data = None
 
             if current_hero_idx is not None:
-                current_hero_data = get_particle_by_index(frame, current_hero_idx)
-                if is_hero_out_of_frame(current_hero_data, switch_margin):
+                # Use optimized version - no redundant frame_set
+                hero_data = get_particle_data_at_current_frame(current_hero_idx)
+                if is_hero_out_of_frame(hero_data, switch_margin):
                     need_new_hero = True
             else:
                 need_new_hero = True
 
             if need_new_hero:
                 # Find best new hero - look ahead to find particle that will be prominent
-                # This creates natural entry animations as particles enter the frame
                 if lookahead_frames > 0:
-                    # Jump to future frame to find the best particle there
                     future_frame = min(frame + lookahead_frames, frame_end)
                     scene.frame_set(future_frame)
                     new_hero_future = find_most_prominent_particle(
                         context, obj, psys_idx, camera, view_margin, selection_mode
                     )
-                    # Jump back to current frame
-                    scene.frame_set(frame)
+                    scene.frame_set(frame)  # Return to current frame
 
                     if new_hero_future is not None:
-                        # Get this particle's data at the CURRENT frame
-                        new_hero = get_particle_by_index(frame, new_hero_future['index'])
+                        # Get this particle's data at current frame - no redundant frame_set
+                        hero_data = get_particle_data_at_current_frame(new_hero_future['index'])
                     else:
-                        # No particle visible in future, fall back to current frame
-                        new_hero = find_most_prominent_particle(
+                        hero_data = find_most_prominent_particle(
                             context, obj, psys_idx, camera, view_margin, selection_mode
                         )
                 else:
-                    # No lookahead - find best particle at current frame
-                    new_hero = find_most_prominent_particle(
+                    hero_data = find_most_prominent_particle(
                         context, obj, psys_idx, camera, view_margin, selection_mode
                     )
 
-                if new_hero is not None:
-                    if current_hero_idx is not None and new_hero['index'] != current_hero_idx:
+                if hero_data is not None:
+                    if current_hero_idx is not None and hero_data['index'] != current_hero_idx:
                         transition_frames.append(frame)
-                    current_hero_idx = new_hero['index']
-                    frame_heroes.append((frame, current_hero_idx, new_hero))
+                    current_hero_idx = hero_data['index']
                 else:
-                    # No visible particle
-                    frame_heroes.append((frame, None, None))
                     current_hero_idx = None
-            else:
-                # Keep tracking current hero
-                frame_heroes.append((frame, current_hero_idx, current_hero_data))
 
-        # Second pass: bake keyframes
-        frames_with_particle = 0
-        frames_without_particle = 0
-
-        pass1_time = time.time() - bake_start_time
-        print(f"  Pass 1 complete in {pass1_time:.1f}s")
-        pass2_start_time = time.time()
-        print(f"  Pass 2/2: Baking keyframes...")
-        for i, (frame, hero_idx, hero_data) in enumerate(frame_heroes):
-            if i == 0 or (i + 1) % 50 == 0 or i == total_frames - 1:
-                pct = 100 * (i + 1) / total_frames
-                elapsed = time.time() - pass2_start_time
-                if i > 0:
-                    eta = elapsed / (i + 1) * (total_frames - i - 1)
-                    eta_str = f", ETA: {eta:.1f}s" if eta >= 0.1 else ", ETA: <0.1s"
-                else:
-                    eta_str = ""
-                print(f"  Pass 2/2: Keyframe {i + 1}/{total_frames} - {pct:.1f}%{eta_str}")
+            # Keyframe immediately while we're at this frame (no separate pass needed)
             if hero_data is not None:
-                scene.frame_set(frame)
-
-                # Set position
                 hero_empty.location = hero_data['location']
                 hero_empty.keyframe_insert(data_path="location", frame=frame)
 
-                # Set scale based on particle size
                 scale_val = max(hero_data['size'], 0.01)
                 hero_empty.scale = (scale_val, scale_val, scale_val)
                 hero_empty.keyframe_insert(data_path="scale", frame=frame)
 
-                # Keyframe custom properties
                 keyframe_custom_property(hero_empty, 'particle_index', hero_data['index'], frame)
                 keyframe_custom_property(hero_empty, 'particle_distance', hero_data['distance'], frame)
                 keyframe_custom_property(hero_empty, 'screen_x', hero_data['screen_x'], frame)
                 keyframe_custom_property(hero_empty, 'screen_y', hero_data['screen_y'], frame)
 
-                # is_transition
+                # is_transition - we know this immediately
                 is_trans = 1 if frame in transition_frames else 0
                 keyframe_custom_property(hero_empty, 'is_transition', is_trans, frame)
-
-                # Note: opacity is keyframed separately in the third pass (transition-based)
 
                 frames_with_particle += 1
             else:
                 frames_without_particle += 1
 
-        # Third pass: keyframe opacity at transition points only
+        main_pass_time = time.time() - bake_start_time
+        print(f"  Main pass complete in {main_pass_time:.1f}s")
+
+        # Opacity keyframes at transition points only (no frame_set needed)
         # This allows Blender's interpolation to create smooth fades
         # At transition frame T: opacity=0
         # At T-N and T+N: opacity=1
@@ -770,10 +745,8 @@ class HEROTRACKER_OT_bake(Operator):
         # Restore original frame
         scene.frame_set(original_frame)
 
-        pass2_time = time.time() - pass2_start_time
         total_time = time.time() - bake_start_time
-        print(f"  Pass 2 complete in {pass2_time:.1f}s")
-        print(f"Hero Tracker: Bake complete in {total_time:.1f}s (Pass1: {pass1_time:.1f}s, Pass2: {pass2_time:.1f}s). {len(transition_frames)} transitions found.")
+        print(f"Hero Tracker: Bake complete in {total_time:.1f}s. {len(transition_frames)} transitions found.")
 
         # Set up text display if enabled
         text_info = ""
@@ -1294,7 +1267,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v1.11.0 registered")
+    print("Hero Tracker v2.0.0 registered")
 
 
 def unregister():
