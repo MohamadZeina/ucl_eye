@@ -1,5 +1,5 @@
 """
-Hero Tracker - Blender Addon
+Hero Tracker - Blender Addon (v3.1.0)
 
 Finds the most prominent particle in camera view and tracks it with an empty.
 For each frame, identifies which particle from a named particle system is
@@ -15,20 +15,32 @@ Custom properties baked on HeroEmpty_fw / HeroEmpty_bw:
 - screen_x, screen_y: Normalized screen coordinates (0-1)
 - is_transition: 1 if particle changed this frame, 0 otherwise
 
+Performance:
+- Frame Step: Evaluate every Nth frame for faster baking (1=full, 2=~2x faster, etc.)
+  Blender interpolates positions between keyframes. Great for testing/previews.
+- Progress display shows ETA with smart formatting (seconds/minutes/hours)
+- Theoretical projections for 1k/10k/100k frames to estimate full bake times
+
 Optional Text Display:
 - Enable "Text Display" in the panel and provide a CSV file path
 - CSV should have columns: cleaned_title, decoded_abstract
 - HeroText_fw and HeroText_bw text objects will be created and updated each frame
 - Text shows the title and abstract of the currently tracked particle
 
+Export Titles:
+- Exports all hero titles AND abstracts to Blender's text editor
+- Shows frame ranges, particle indices, and unique hero count
+- Useful for reviewing which papers appear in the animation
+
 Usage:
 1. Name your particle system (e.g., "GalaxyParticles")
 2. Open the N-panel > Hero Tracker tab
 3. Enter the particle system name
 4. Select your camera(s) - forward required, backward optional
-5. (Optional) Enable Text Display and select CSV file
-6. Click "Bake Hero Track"
-7. Empties will be keyframed to follow the most prominent particle for each camera
+5. (Optional) Set Frame Step > 1 for faster baking
+6. (Optional) Enable Text Display and select CSV file
+7. Click "Bake Hero Track"
+8. Empties will be keyframed to follow the most prominent particle for each camera
 """
 
 bl_info = {

@@ -856,6 +856,146 @@ class MolRestoreFields(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MolCommandLineRender(bpy.types.Operator):
+    """Launch animation render in a new Terminal window.
+    Properly restores particle sizes/colors from CSV before rendering."""
+
+    bl_idname = "object.mol_commandline_render"
+    bl_label = "Render Animation (CMD)"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import subprocess
+        import platform
+        import tempfile
+        import os
+
+        # Save the file first
+        if not bpy.data.filepath:
+            self.report({'ERROR'}, "Please save the file first")
+            return {'CANCELLED'}
+
+        bpy.ops.wm.save_mainfile()
+
+        # Get Blender executable path
+        blender_path = bpy.app.binary_path
+        blend_file = bpy.data.filepath
+        scene = context.scene
+        frame_info = f"frames {scene.frame_start}-{scene.frame_end}"
+
+        # Build the Python script to run inside Blender
+        python_script = '''
+import bpy
+
+print("=" * 60)
+print("Molecular+ Command Line Render")
+print("=" * 60)
+
+# Restore sizes and colors from CSV
+print("Restoring particle sizes from CSV...")
+try:
+    bpy.ops.object.mol_restore_sizes()
+    print("  Sizes restored successfully")
+except Exception as e:
+    print(f"  Warning: Could not restore sizes: {e}")
+
+print("Restoring particle colors from CSV...")
+try:
+    bpy.ops.object.mol_restore_fields()
+    print("  Colors restored successfully")
+except Exception as e:
+    print(f"  Warning: Could not restore colors: {e}")
+
+print("=" * 60)
+print("Starting animation render...")
+print("=" * 60)
+
+# Render animation
+bpy.ops.render.render(animation=True)
+
+print("=" * 60)
+print("Render complete!")
+print("=" * 60)
+'''
+
+        # Write Python script to temp file
+        python_script_file = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.py', delete=False, prefix='mol_render_'
+        )
+        python_script_file.write(python_script)
+        python_script_file.close()
+
+        # Write shell script to temp file (handles paths with spaces properly)
+        shell_script = f'''#!/bin/bash
+echo "============================================================"
+echo "Molecular+ Command Line Render"
+echo "============================================================"
+echo "Blender: {blender_path}"
+echo "File: {blend_file}"
+echo "============================================================"
+"{blender_path}" -b "{blend_file}" --python "{python_script_file.name}"
+echo ""
+echo "============================================================"
+echo "Render process finished."
+echo "============================================================"
+read -p "Press Enter to close this window..."
+rm "{python_script_file.name}"
+'''
+
+        shell_script_file = tempfile.NamedTemporaryFile(
+            mode='w', suffix='.sh', delete=False, prefix='mol_render_'
+        )
+        shell_script_file.write(shell_script)
+        shell_script_file.close()
+        os.chmod(shell_script_file.name, 0o755)
+
+        print(f"Molecular+: Launching command line render in new Terminal...")
+        print(f"  Blender: {blender_path}")
+        print(f"  File: {blend_file}")
+        print(f"  Frames: {scene.frame_start}-{scene.frame_end}")
+        print(f"  Script: {shell_script_file.name}")
+
+        # Open in new Terminal window (platform-specific)
+        if platform.system() == 'Darwin':  # macOS
+            # Use open -a Terminal to run the shell script
+            subprocess.Popen(['open', '-a', 'Terminal', shell_script_file.name])
+
+        elif platform.system() == 'Windows':
+            # On Windows, write a .bat file instead
+            bat_script = f'''@echo off
+echo ============================================================
+echo Molecular+ Command Line Render
+echo ============================================================
+"{blender_path}" -b "{blend_file}" --python "{python_script_file.name}"
+echo.
+echo Render process finished.
+pause
+del "{python_script_file.name}"
+del "%~f0"
+'''
+            bat_file = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.bat', delete=False, prefix='mol_render_'
+            )
+            bat_file.write(bat_script)
+            bat_file.close()
+            subprocess.Popen(['start', 'cmd', '/c', bat_file.name], shell=True)
+
+        else:  # Linux
+            terminals = ['gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm']
+            for term in terminals:
+                try:
+                    if term == 'gnome-terminal':
+                        subprocess.Popen([term, '--', shell_script_file.name])
+                    else:
+                        subprocess.Popen([term, '-e', shell_script_file.name])
+                    break
+                except FileNotFoundError:
+                    continue
+
+        self.report({'INFO'}, f"Render started in new Terminal: {frame_info}")
+        return {'FINISHED'}
+
+
 operator_classes = (
     MolSimulateModal,
     MolSimulate,
@@ -872,4 +1012,5 @@ operator_classes = (
     MolToolsConvertGeo,
     MolRestoreSizes,
     MolRestoreFields,
+    MolCommandLineRender,
 )

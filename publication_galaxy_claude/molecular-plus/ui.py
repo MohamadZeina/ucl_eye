@@ -1,5 +1,38 @@
 import bpy
+import os
 from .utils import get_object
+
+# Cache for CSV row counts to avoid reading file on every UI redraw
+_csv_count_cache = {}  # {csv_path: (mtime, row_count)}
+
+
+def get_csv_row_count(csv_path):
+    """Get CSV row count with caching. Only re-reads if file modified."""
+    global _csv_count_cache
+
+    abs_path = bpy.path.abspath(csv_path)
+    if not os.path.exists(abs_path):
+        return None
+
+    try:
+        mtime = os.path.getmtime(abs_path)
+
+        # Return cached count if file hasn't changed
+        if abs_path in _csv_count_cache:
+            cached_mtime, cached_count = _csv_count_cache[abs_path]
+            if cached_mtime == mtime:
+                return cached_count
+
+        # File changed or not cached - count rows
+        import csv
+        with open(abs_path) as f:
+            reader = csv.DictReader(f)
+            count = sum(1 for _ in reader)
+
+        _csv_count_cache[abs_path] = (mtime, count)
+        return count
+    except Exception:
+        return None
 
 
 class MS_PT_MolecularHelperPanel(bpy.types.Panel):
@@ -71,6 +104,16 @@ class MS_PT_MolecularHelperPanel(bpy.types.Panel):
             box = layout.box()
             row = box.row()
             row.label(text="No Object selected")
+
+        # Command line render - always visible
+        layout.separator()
+        box = layout.box()
+        row = box.row()
+        row.scale_y = 1.3
+        row.operator(
+            "object.mol_commandline_render", text="Render Animation (CMD)", icon="CONSOLE"
+        )
+        box.label(text="Opens Terminal, restores CSV sizes", icon="INFO")
 
 
 class MS_PT_MolecularInspectPanel(bpy.types.Panel):
@@ -470,25 +513,19 @@ class MS_PT_MolecularPanel(bpy.types.Panel):
         row.operator("object.mol_restore_sizes", text="Restore Sizes", icon="FILE_REFRESH")
         row.operator("object.mol_restore_fields", text="Restore Colors", icon="COLOR")
 
-        # Show CSV info if file is set
+        # Show CSV info if file is set (uses cached row count)
         csv_path = psys.settings.mol_initial_csv
         if csv_path:
-            import os
             if os.path.exists(bpy.path.abspath(csv_path)):
-                try:
-                    import csv
-                    with open(bpy.path.abspath(csv_path)) as f:
-                        reader = csv.DictReader(f)
-                        csv_count = sum(1 for _ in reader)
-                    par_count = psys.settings.count
-                    row = box.row()
-                    if csv_count == par_count:
-                        row.label(text=f"CSV: {csv_count} | Particles: {par_count} ✓", icon="INFO")
-                    else:
-                        row.label(text=f"CSV: {csv_count} | Particles: {par_count} ⚠", icon="ERROR")
-                except Exception as e:
-                    row = box.row()
-                    row.label(text=f"CSV error: {str(e)[:30]}", icon="ERROR")
+                csv_count = get_csv_row_count(csv_path)
+                par_count = psys.settings.count
+                row = box.row()
+                if csv_count is None:
+                    row.label(text="CSV error", icon="ERROR")
+                elif csv_count == par_count:
+                    row.label(text=f"CSV: {csv_count} | Particles: {par_count} ✓", icon="INFO")
+                else:
+                    row.label(text=f"CSV: {csv_count} | Particles: {par_count} ⚠", icon="ERROR")
             else:
                 row = box.row()
                 row.label(text="File not found", icon="ERROR")
