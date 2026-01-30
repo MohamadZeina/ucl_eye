@@ -1,5 +1,5 @@
 """
-Hero Tracker - Blender Addon (v3.1.0)
+Hero Tracker - Blender Addon (v3.2.0)
 
 Finds the most prominent particle in camera view and tracks it with an empty.
 For each frame, identifies which particle from a named particle system is
@@ -20,6 +20,12 @@ Performance:
   Blender interpolates positions between keyframes. Great for testing/previews.
 - Progress display shows ETA with smart formatting (seconds/minutes/hours)
 - Theoretical projections for 1k/10k/100k frames to estimate full bake times
+
+Text Scale Factor:
+- When text spirals around particles are larger than the particles themselves,
+  set Text Scale Factor to account for this (e.g., 10.0 if text is ~10x larger).
+- This affects when heroes are considered "out of frame" for switching.
+- Allows using a lower Switch Margin while still ensuring text is off-screen.
 
 Optional Text Display:
 - Enable "Text Display" in the panel and provide a CSV file path
@@ -46,7 +52,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (3, 1, 0),
+    "version": (3, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -519,6 +525,7 @@ class HEROTRACKER_OT_bake(Operator):
 
         view_margin = props.view_margin
         switch_margin = props.switch_margin
+        text_scale_factor = props.text_scale_factor
         selection_mode = props.selection_mode
         lookahead_frames = props.lookahead_frames
         fade_frames = props.fade_frames
@@ -594,13 +601,15 @@ class HEROTRACKER_OT_bake(Operator):
             }
 
         def is_hero_out_of_frame(particle_data, camera, margin):
-            """Check if hero particle is out of frame considering margin."""
+            """Check if hero particle is out of frame considering margin and text scale."""
             if particle_data is None:
                 return True
 
             screen_radius, _ = get_screen_radius(
                 scene, camera, particle_data['location'], particle_data['size']
             )
+            # Scale radius to account for text spiral being larger than particle
+            effective_radius = screen_radius * text_scale_factor
 
             sx = particle_data['screen_x']
             sy = particle_data['screen_y']
@@ -608,10 +617,10 @@ class HEROTRACKER_OT_bake(Operator):
             lower = 0.0 - margin
             upper = 1.0 + margin
 
-            out_left = sx + screen_radius < lower
-            out_right = sx - screen_radius > upper
-            out_bottom = sy + screen_radius < lower
-            out_top = sy - screen_radius > upper
+            out_left = sx + effective_radius < lower
+            out_right = sx - effective_radius > upper
+            out_bottom = sy + effective_radius < lower
+            out_top = sy - effective_radius > upper
 
             return out_left or out_right or out_bottom or out_top
 
@@ -1125,6 +1134,20 @@ class HeroTrackerProperties(PropertyGroup):
         precision=2
     )
 
+    text_scale_factor: FloatProperty(
+        name="Text Scale Factor",
+        description=(
+            "Multiplier for particle screen radius to account for text spiral size. "
+            "Set to approximate how many times larger the text spiral is than the particle. "
+            "1.0 = particle radius only, 10.0 = text is ~10x larger than particle."
+        ),
+        default=1.0,
+        min=1.0,
+        soft_max=20.0,
+        step=10,
+        precision=1
+    )
+
     lookahead_frames: IntProperty(
         name="Lookahead Frames",
         description=(
@@ -1258,6 +1281,7 @@ class HEROTRACKER_PT_main(Panel):
         box.label(text="Margins:", icon='FULLSCREEN_ENTER')
         box.prop(props, "view_margin")
         box.prop(props, "switch_margin")
+        box.prop(props, "text_scale_factor")
 
         # Text Display (optional)
         layout.separator()
