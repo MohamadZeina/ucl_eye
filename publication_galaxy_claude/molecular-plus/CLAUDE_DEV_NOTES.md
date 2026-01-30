@@ -347,6 +347,56 @@ When something doesn't work:
 
 ---
 
+## Command Line Rendering with Batching
+
+### The Problem
+Command line renders (especially long animations) can leak memory continuously, eventually consuming all RAM. On a 512GB Mac, we observed memory climbing from 70GB to 270GB+ during unbatched renders.
+
+### The Solution
+The `Render Animation (CMD)` button in the Molecular+ panel supports batched rendering. Set **Batch Size** > 0 to render in chunks, with Blender restarting between batches to free memory.
+
+### Memory Formula
+
+Based on empirical testing with particle simulations:
+
+**For 2 concurrent renders:**
+```
+Peak Memory ≈ 70 + (batch_size ÷ step) × 3 GB
+```
+
+**For 1 render:**
+```
+Peak Memory ≈ 70 + (batch_size ÷ step) × 1.5 GB
+```
+
+Where:
+- `batch_size` = the Batch Size setting in the UI
+- `step` = scene's frame step (e.g., 128 means render every 128th frame)
+- 70GB = approximate base memory for loaded scene
+
+### Solving for Batch Size
+
+To stay under a target memory:
+```
+batch_size = (target_memory - 70) ÷ 3 × step    # for 2 renders
+batch_size = (target_memory - 70) ÷ 1.5 × step  # for 1 render
+```
+
+**Example:** Target 250GB max with step=128, 2 renders:
+```
+batch_size = (250 - 70) ÷ 3 × 128 = 7680
+```
+
+### Tested Configuration
+- Batch size: 11000, Step: 128, 2 concurrent renders
+- Actual peak: **338GB** (predicted: 328GB)
+- Memory dropped to ~70GB between batches as expected
+
+### UI Location
+The Batch Size field appears below the "Render Animation (CMD)" button in the main Molecular+ panel. Set to 0 for no batching (renders all frames at once).
+
+---
+
 ## Git Recovery Commands
 
 ```bash
