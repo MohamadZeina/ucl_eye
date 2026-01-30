@@ -113,7 +113,11 @@ class MS_PT_MolecularHelperPanel(bpy.types.Panel):
         row.operator(
             "object.mol_commandline_render", text="Render Animation (CMD)", icon="CONSOLE"
         )
-        box.label(text="Opens Terminal, restores CSV sizes", icon="INFO")
+        box.prop(context.scene, "mol_render_batch_size")
+        if context.scene.mol_render_batch_size > 0:
+            box.label(text="Restarts Blender between batches", icon="INFO")
+        else:
+            box.label(text="Opens Terminal, restores CSV sizes", icon="INFO")
 
 
 class MS_PT_MolecularInspectPanel(bpy.types.Panel):

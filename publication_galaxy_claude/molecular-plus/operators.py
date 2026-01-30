@@ -858,7 +858,8 @@ class MolRestoreFields(bpy.types.Operator):
 
 class MolCommandLineRender(bpy.types.Operator):
     """Launch animation render in a new Terminal window.
-    Properly restores particle sizes/colors from CSV before rendering."""
+    Properly restores particle sizes/colors from CSV before rendering.
+    Supports batched rendering to prevent memory leaks."""
 
     bl_idname = "object.mol_commandline_render"
     bl_label = "Render Animation (CMD)"
@@ -881,7 +882,10 @@ class MolCommandLineRender(bpy.types.Operator):
         blender_path = bpy.app.binary_path
         blend_file = bpy.data.filepath
         scene = context.scene
-        frame_info = f"frames {scene.frame_start}-{scene.frame_end}"
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+        batch_size = scene.mol_render_batch_size
+        frame_info = f"frames {frame_start}-{frame_end}"
 
         # Build the Python script to run inside Blender
         python_script = '''
@@ -925,8 +929,55 @@ print("=" * 60)
         python_script_file.write(python_script)
         python_script_file.close()
 
-        # Write shell script to temp file (handles paths with spaces properly)
-        shell_script = f'''#!/bin/bash
+        # Generate shell script - either batched or single run
+        if batch_size > 0:
+            # Batched rendering - loop through frame ranges
+            shell_script = f'''#!/bin/bash
+echo "============================================================"
+echo "Molecular+ Command Line Render (BATCHED)"
+echo "============================================================"
+echo "Blender: {blender_path}"
+echo "File: {blend_file}"
+echo "Frames: {frame_start} to {frame_end}"
+echo "Batch size: {batch_size} frames"
+echo "============================================================"
+
+FRAME_START={frame_start}
+FRAME_END={frame_end}
+BATCH_SIZE={batch_size}
+
+CURRENT=$FRAME_START
+BATCH_NUM=1
+
+while [ $CURRENT -le $FRAME_END ]; do
+    BATCH_END=$((CURRENT + BATCH_SIZE - 1))
+    if [ $BATCH_END -gt $FRAME_END ]; then
+        BATCH_END=$FRAME_END
+    fi
+
+    echo ""
+    echo "============================================================"
+    echo "BATCH $BATCH_NUM: Rendering frames $CURRENT to $BATCH_END"
+    echo "============================================================"
+
+    "{blender_path}" -b "{blend_file}" -s $CURRENT -e $BATCH_END --python "{python_script_file.name}" -a
+
+    echo "Batch $BATCH_NUM complete."
+
+    CURRENT=$((BATCH_END + 1))
+    BATCH_NUM=$((BATCH_NUM + 1))
+done
+
+echo ""
+echo "============================================================"
+echo "All batches complete!"
+echo "============================================================"
+read -p "Press Enter to close this window..."
+rm "{python_script_file.name}"
+'''
+        else:
+            # Single run - render all frames at once
+            shell_script = f'''#!/bin/bash
 echo "============================================================"
 echo "Molecular+ Command Line Render"
 echo "============================================================"
@@ -952,7 +1003,9 @@ rm "{python_script_file.name}"
         print(f"Molecular+: Launching command line render in new Terminal...")
         print(f"  Blender: {blender_path}")
         print(f"  File: {blend_file}")
-        print(f"  Frames: {scene.frame_start}-{scene.frame_end}")
+        print(f"  Frames: {frame_start}-{frame_end}")
+        if batch_size > 0:
+            print(f"  Batch size: {batch_size} frames")
         print(f"  Script: {shell_script_file.name}")
 
         # Open in new Terminal window (platform-specific)
@@ -962,7 +1015,52 @@ rm "{python_script_file.name}"
 
         elif platform.system() == 'Windows':
             # On Windows, write a .bat file instead
-            bat_script = f'''@echo off
+            if batch_size > 0:
+                bat_script = f'''@echo off
+echo ============================================================
+echo Molecular+ Command Line Render (BATCHED)
+echo ============================================================
+echo Blender: {blender_path}
+echo File: {blend_file}
+echo Frames: {frame_start} to {frame_end}
+echo Batch size: {batch_size} frames
+echo ============================================================
+
+set CURRENT={frame_start}
+set FRAME_END={frame_end}
+set BATCH_SIZE={batch_size}
+set BATCH_NUM=1
+
+:loop
+if %CURRENT% gtr %FRAME_END% goto done
+
+set /a BATCH_END=%CURRENT% + %BATCH_SIZE% - 1
+if %BATCH_END% gtr %FRAME_END% set BATCH_END=%FRAME_END%
+
+echo.
+echo ============================================================
+echo BATCH %BATCH_NUM%: Rendering frames %CURRENT% to %BATCH_END%
+echo ============================================================
+
+"{blender_path}" -b "{blend_file}" -s %CURRENT% -e %BATCH_END% --python "{python_script_file.name}" -a
+
+echo Batch %BATCH_NUM% complete.
+
+set /a CURRENT=%BATCH_END% + 1
+set /a BATCH_NUM=%BATCH_NUM% + 1
+goto loop
+
+:done
+echo.
+echo ============================================================
+echo All batches complete!
+echo ============================================================
+pause
+del "{python_script_file.name}"
+del "%~f0"
+'''
+            else:
+                bat_script = f'''@echo off
 echo ============================================================
 echo Molecular+ Command Line Render
 echo ============================================================
@@ -992,7 +1090,10 @@ del "%~f0"
                 except FileNotFoundError:
                     continue
 
-        self.report({'INFO'}, f"Render started in new Terminal: {frame_info}")
+        if batch_size > 0:
+            self.report({'INFO'}, f"Batched render started: {frame_info}, batch size {batch_size}")
+        else:
+            self.report({'INFO'}, f"Render started in new Terminal: {frame_info}")
         return {'FINISHED'}
 
 

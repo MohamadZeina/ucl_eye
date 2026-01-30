@@ -677,3 +677,16 @@ def define_props():
     bpy.types.Scene.mol_totallink = bpy.props.IntProperty()
     bpy.types.Scene.mol_totaldeadlink = bpy.props.IntProperty()
     bpy.types.Scene.mol_cancel = bpy.props.BoolProperty(default=False)
+
+    # Command line render batching
+    bpy.types.Scene.mol_render_batch_size = bpy.props.IntProperty(
+        name="Batch Size",
+        description=(
+            "Render in batches of this many frames, restarting Blender between batches "
+            "to free memory. Set to 0 to render all frames at once (no batching). "
+            "Respects the scene's frame step setting."
+        ),
+        default=0,
+        min=0,
+        soft_max=500
+    )
