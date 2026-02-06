@@ -181,17 +181,22 @@ def find_continuous_frames(directory, start=None, end=None):
     return frames
 
 
+def _print(*args, **kwargs):
+    """Print with flush for real-time output in background processes."""
+    print(*args, **kwargs, flush=True)
+
+
 def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
     """Scan a continuous frame range and detect anomalies."""
-    print(f"\n{'='*70}")
-    print(f"Scanning: {label}")
-    print(f"Directory: {directory}")
-    print(f"Expected range: {start} -> {end}")
-    print(f"{'='*70}")
+    _print(f"\n{'='*70}")
+    _print(f"Scanning: {label}")
+    _print(f"Directory: {directory}")
+    _print(f"Expected range: {start} -> {end}")
+    _print(f"{'='*70}")
 
     frames = find_continuous_frames(directory, start, end)
     if not frames:
-        print(f"  ERROR: No frames found in {directory}")
+        _print(f"  ERROR: No frames found in {directory}")
         return None
 
     # Filter to step-1 only
@@ -206,7 +211,7 @@ def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
             break  # End of continuous run
 
     frames = step1_frames
-    print(f"  Found {len(frames)} consecutive step-1 frames: {frames[0][0]} -> {frames[-1][0]}")
+    _print(f"  Found {len(frames)} consecutive step-1 frames: {frames[0][0]} -> {frames[-1][0]}")
 
     # Build work items: (current_path, prev_path_or_None, downscale)
     work = []
@@ -221,7 +226,7 @@ def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
 
     if throttle > 0:
         # Sequential mode with throttling to reduce I/O pressure
-        print(f"  Throttled mode: {throttle}s sleep between frames, {workers} worker(s)")
+        _print(f"  Throttled mode: {throttle}s sleep between frames, {workers} worker(s)")
         for i, w in enumerate(work):
             results[i] = analyze_single_frame(w)
             completed += 1
@@ -229,7 +234,7 @@ def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
                 elapsed = time.time() - t0
                 fps = completed / elapsed if elapsed > 0 else 0
                 eta = (len(work) - completed) / fps if fps > 0 else 0
-                print(f"  Progress: {completed}/{len(work)} ({fps:.1f} frames/s, ETA {eta:.0f}s)")
+                _print(f"  Progress: {completed}/{len(work)} ({fps:.1f} frames/s, ETA {eta:.0f}s)")
             time.sleep(throttle)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -242,17 +247,17 @@ def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
                     elapsed = time.time() - t0
                     fps = completed / elapsed if elapsed > 0 else 0
                     eta = (len(work) - completed) / fps if fps > 0 else 0
-                    print(f"  Progress: {completed}/{len(work)} ({fps:.1f} frames/s, ETA {eta:.0f}s)")
+                    _print(f"  Progress: {completed}/{len(work)} ({fps:.1f} frames/s, ETA {eta:.0f}s)")
 
     elapsed = time.time() - t0
-    print(f"  Done in {elapsed:.1f}s ({len(work)/elapsed:.1f} frames/s)")
+    _print(f"  Done in {elapsed:.1f}s ({len(work)/elapsed:.1f} frames/s)")
 
     # Detect anomalies using statistical outliers
     anomalies = detect_anomalies(results)
 
-    # Save detailed results
+    # Save detailed results (include frame range in filename to avoid collisions)
     safe_label = label.replace(" ", "_").replace("(", "").replace(")", "")
-    result_path = Path(output_dir) / f"results_{safe_label}.json"
+    result_path = Path(output_dir) / f"results_{safe_label}_{frames[0][0]}-{frames[-1][0]}.json"
     with open(result_path, "w") as f:
         json.dump({
             "label": label,
@@ -263,17 +268,17 @@ def scan_range(directory, label, start, end, output_dir, workers=4, throttle=0):
             "anomalies": anomalies,
             "all_results": results,
         }, f, indent=2)
-    print(f"  Results saved to: {result_path}")
+    _print(f"  Results saved to: {result_path}")
 
     # Print anomalies
     if anomalies:
-        print(f"\n  *** ANOMALIES DETECTED: {len(anomalies)} ***")
+        _print(f"\n  *** ANOMALIES DETECTED: {len(anomalies)} ***")
         for a in anomalies[:20]:
-            print(f"    Frame {a['frame']}: {', '.join(a['reasons'])}")
+            _print(f"    Frame {a['frame']}: {', '.join(a['reasons'])}")
         if len(anomalies) > 20:
-            print(f"    ... and {len(anomalies) - 20} more")
+            _print(f"    ... and {len(anomalies) - 20} more")
     else:
-        print(f"  No anomalies detected.")
+        _print(f"  No anomalies detected.")
 
     return anomalies
 
@@ -415,15 +420,15 @@ def main():
         sys.exit(1)
 
     # Summary
-    print(f"\n{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
+    _print(f"\n{'='*70}")
+    _print("SUMMARY")
+    _print(f"{'='*70}")
     total_anomalies = 0
     for label, anomalies in all_anomalies.items():
-        print(f"  {label}: {len(anomalies)} anomalies")
+        _print(f"  {label}: {len(anomalies)} anomalies")
         total_anomalies += len(anomalies)
-    print(f"  TOTAL: {total_anomalies} anomalous frames")
-    print(f"  Results saved in: {output_dir}/")
+    _print(f"  TOTAL: {total_anomalies} anomalous frames")
+    _print(f"  Results saved in: {output_dir}/")
 
 
 if __name__ == "__main__":
