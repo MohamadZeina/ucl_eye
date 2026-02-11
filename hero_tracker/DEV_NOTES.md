@@ -1,6 +1,6 @@
 # Hero Tracker Development Notes
 
-## Planned Feature: Minimum Screen Radius Exit Criteria
+## Implemented Feature: Minimum Screen Radius Exit Criteria (v3.3.0)
 
 ### The Problem
 
@@ -92,9 +92,15 @@ To test this feature:
 
 ---
 
-## Current Version: 3.2.0
+## Current Version: 3.3.0
 
-### Recent Changes (v3.2.0)
+### Recent Changes (v3.3.0)
+- Added `min_screen_radius` property to trigger hero switch when particle shrinks too small
+- Added `is_hero_too_small()` check function that uses `effective_radius = screen_radius * text_scale_factor`
+- Modified switch logic: `if is_hero_out_of_frame(...) or is_hero_too_small(...)`
+- Solves circular camera path problem (camera pulls away, particle shrinks but stays on screen)
+
+### Previous Changes (v3.2.0)
 - Added `text_scale_factor` property to account for text spirals being larger than particles
 - Modified `is_hero_out_of_frame()` to use `effective_radius = screen_radius * text_scale_factor`
 

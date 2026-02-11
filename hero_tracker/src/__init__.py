@@ -1,5 +1,5 @@
 """
-Hero Tracker - Blender Addon (v3.2.0)
+Hero Tracker - Blender Addon (v3.3.0)
 
 Finds the most prominent particle in camera view and tracks it with an empty.
 For each frame, identifies which particle from a named particle system is
@@ -27,6 +27,12 @@ Text Scale Factor:
 - This affects when heroes are considered "out of frame" for switching.
 - Allows using a lower Switch Margin while still ensuring text is off-screen.
 
+Min Screen Radius:
+- When the camera pulls away from particles (e.g., circular camera path),
+  particles may shrink but stay on screen, making text tiny and ugly.
+- Set Min Screen Radius to trigger hero switch when particle becomes too small.
+- Value is fraction of frame height (0.02 = 2% of frame = ~77px at 4K).
+
 Optional Text Display:
 - Enable "Text Display" in the panel and provide a CSV file path
 - CSV should have columns: cleaned_title, decoded_abstract
@@ -52,7 +58,7 @@ Usage:
 bl_info = {
     "name": "Hero Tracker",
     "author": "UCL Eye Project",
-    "version": (3, 2, 0),
+    "version": (3, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > N-Panel > Hero Tracker",
     "description": "Track the most prominent particle in camera view with an empty",
@@ -526,6 +532,7 @@ class HEROTRACKER_OT_bake(Operator):
         view_margin = props.view_margin
         switch_margin = props.switch_margin
         text_scale_factor = props.text_scale_factor
+        min_screen_radius = props.min_screen_radius
         selection_mode = props.selection_mode
         lookahead_frames = props.lookahead_frames
         fade_frames = props.fade_frames
@@ -624,6 +631,20 @@ class HEROTRACKER_OT_bake(Operator):
 
             return out_left or out_right or out_bottom or out_top
 
+        def is_hero_too_small(particle_data, camera):
+            """Check if hero particle has shrunk below minimum visible size."""
+            if particle_data is None:
+                return True
+            if min_screen_radius <= 0:
+                return False  # Feature disabled
+
+            screen_radius, _ = get_screen_radius(
+                scene, camera, particle_data['location'], particle_data['size']
+            )
+            # Use effective radius (accounts for text spiral size)
+            effective_radius = screen_radius * text_scale_factor
+            return effective_radius < min_screen_radius
+
         # Initialize tracking state for each camera
         track_state = {}
         for suffix, camera in cameras:
@@ -693,7 +714,8 @@ class HEROTRACKER_OT_bake(Operator):
 
                 if current_hero_idx is not None:
                     current_hero_data = get_particle_by_index_for_camera(current_hero_idx, camera)
-                    if is_hero_out_of_frame(current_hero_data, camera, switch_margin):
+                    if is_hero_out_of_frame(current_hero_data, camera, switch_margin) or \
+                       is_hero_too_small(current_hero_data, camera):
                         need_new_hero = True
                 else:
                     need_new_hero = True
@@ -981,6 +1003,98 @@ class HEROTRACKER_OT_bake_rotation(Operator):
         return {'FINISHED'}
 
 
+class HEROTRACKER_OT_probe_radius(Operator):
+    """Probe both heroes' screen radius, margin buffer, and switch status"""
+    bl_idname = "herotracker.probe_radius"
+    bl_label = "Probe Hero Radius"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        scene = context.scene
+        props = scene.hero_tracker
+        text_scale_factor = props.text_scale_factor
+        switch_margin = props.switch_margin
+        min_screen_radius = props.min_screen_radius
+
+        # Build list of (suffix, hero, camera) tuples to probe
+        to_probe = []
+        for suffix, camera_prop in [('_fw', props.camera_fw), ('_bw', props.camera_bw)]:
+            hero_name = f"HeroEmpty{suffix}"
+            hero = bpy.data.objects.get(hero_name)
+            if hero and "particle_index" in hero and camera_prop:
+                to_probe.append((suffix, hero, camera_prop))
+
+        if not to_probe:
+            self.report({'ERROR'}, "No HeroEmpty with particle_index and matching camera found. Bake first.")
+            return {'CANCELLED'}
+
+        print(f"\n{'='*70}")
+        print(f"HERO RADIUS PROBE - Frame {scene.frame_current}")
+        print(f"Settings: scale={text_scale_factor:.1f}x, switch_margin={switch_margin:.3f}, min_radius={min_screen_radius:.4f}")
+        print(f"{'='*70}")
+
+        info_parts = []
+
+        for suffix, hero, camera in to_probe:
+            particle_idx = int(hero["particle_index"])
+            hero_loc = hero.location.copy()
+            hero_size = hero.scale[0]
+
+            # Calculate screen radius
+            screen_radius, screen_coords = get_screen_radius(scene, camera, hero_loc, hero_size)
+            effective_radius = screen_radius * text_scale_factor
+            sx, sy = screen_coords.x, screen_coords.y
+
+            # Calculate critical margin for each edge
+            margin_left = -(sx + effective_radius)
+            margin_right = sx - effective_radius - 1
+            margin_bottom = -(sy + effective_radius)
+            margin_top = sy - effective_radius - 1
+
+            critical_margin = max(margin_left, margin_right, margin_bottom, margin_top)
+            margins = [(margin_left, "L"), (margin_right, "R"), (margin_bottom, "B"), (margin_top, "T")]
+            closest_edge = max(margins, key=lambda x: x[0])
+
+            buffer = switch_margin - critical_margin
+
+            # Determine switch status
+            out_of_frame = buffer < 0
+            too_small = effective_radius < min_screen_radius if min_screen_radius > 0 else False
+            would_switch = out_of_frame or too_small
+
+            # Build status string
+            if would_switch:
+                reasons = []
+                if out_of_frame:
+                    reasons.append(f"OUT {closest_edge[1]}")
+                if too_small:
+                    reasons.append("SMALL")
+                status = f"SWITCH ({'+'.join(reasons)})"
+            else:
+                status = "STABLE"
+
+            # Print details for this hero
+            cam_name = camera.name[:15]
+            print(f"\n  {suffix[1:].upper()} | HeroEmpty{suffix} | Camera: {cam_name} | Particle: {particle_idx}")
+            print(f"     Position: ({sx:.3f}, {sy:.3f})")
+            print(f"     Radius:   raw={screen_radius*100:.2f}%, eff={effective_radius*100:.2f}% (×{text_scale_factor:.1f})")
+            if min_screen_radius > 0:
+                size_ok = "OK" if not too_small else "FAIL"
+                print(f"     Min size: {effective_radius*100:.2f}% vs {min_screen_radius*100:.2f}% threshold → {size_ok}")
+            print(f"     Margins:  L={margin_left*100:+.1f}% R={margin_right*100:+.1f}% B={margin_bottom*100:+.1f}% T={margin_top*100:+.1f}%")
+            print(f"     Closest:  {closest_edge[1]} edge, buffer={buffer*100:+.1f}%")
+            print(f"     ► STATUS: {status}")
+
+            # Build compact info for status bar
+            info_parts.append(f"{suffix[1:]}: {status} r={effective_radius*100:.1f}% buf={buffer*100:+.0f}%")
+
+        print(f"\n{'='*70}\n")
+
+        self.report({'INFO'}, " | ".join(info_parts))
+
+        return {'FINISHED'}
+
+
 class HEROTRACKER_OT_export_titles(Operator):
     """Export hero titles to Blender text editor (reads baked keyframes + CSV)"""
     bl_idname = "herotracker.export_titles"
@@ -1148,6 +1262,20 @@ class HeroTrackerProperties(PropertyGroup):
         precision=1
     )
 
+    min_screen_radius: FloatProperty(
+        name="Min Screen Radius",
+        description=(
+            "Minimum screen radius (as fraction of frame) before triggering hero switch. "
+            "Prevents text from shrinking too small when camera pulls away. "
+            "0 = disabled, 0.02 = switch when particle is 2% of frame height."
+        ),
+        default=0.0,
+        min=0.0,
+        max=0.2,
+        step=1,
+        precision=3
+    )
+
     lookahead_frames: IntProperty(
         name="Lookahead Frames",
         description=(
@@ -1282,6 +1410,8 @@ class HEROTRACKER_PT_main(Panel):
         box.prop(props, "view_margin")
         box.prop(props, "switch_margin")
         box.prop(props, "text_scale_factor")
+        box.prop(props, "min_screen_radius")
+        box.operator("herotracker.probe_radius", icon='EYEDROPPER')
 
         # Text Display (optional)
         layout.separator()
@@ -1368,6 +1498,7 @@ classes = (
     HEROTRACKER_OT_bake,
     HEROTRACKER_OT_clear,
     HEROTRACKER_OT_bake_rotation,
+    HEROTRACKER_OT_probe_radius,
     HEROTRACKER_OT_export_titles,
     HEROTRACKER_PT_main,
 )
@@ -1378,7 +1509,7 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.hero_tracker = PointerProperty(type=HeroTrackerProperties)
-    print("Hero Tracker v3.1.0 registered")
+    print("Hero Tracker v3.3.0 registered")
 
 
 def unregister():

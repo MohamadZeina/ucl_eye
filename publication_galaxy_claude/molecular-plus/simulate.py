@@ -6,6 +6,55 @@ import csv as csv_module
 from .utils import get_object
 
 
+# Field level 1 -> grouped ID mapping (sorted by field_level_0 FREQUENCY)
+# Most common categories first for better color distribution with blackbody ramp
+# Medicine: 0-40, Biology: 41-58, Psychology: 59-72, Computer science: 73-126,
+# Chemistry: 127-146, Physics: 147-162, Materials science: 163-175, Sociology: 176-187,
+# Geology: 188-199, Mathematics: 200-206, Political science: 207-215, Business: 216-231,
+# Geography: 232-240, Environmental science: 241-251, Economics: 252-268,
+# History: 269-272, Engineering: 273-278, Art: 279-282, Philosophy: 283
+GROUPED_FIELD_L1_IDS = {
+    # Medicine (0-40) - 36% of data
+    "Anatomy": 0, "Anesthesia": 1, "Animal science": 2, "Bioinformatics": 3, "Cardiology": 4, "Demography": 5, "Dentistry": 6, "Dermatology": 7, "Emergency medicine": 8, "Environmental health": 9, "Family medicine": 10, "Gastroenterology": 11, "General surgery": 12, "Gerontology": 13, "Gynecology": 14, "Immunology": 15, "Intensive care medicine": 16, "Internal medicine": 17, "Library science": 18, "Medical education": 19, "Medical emergency": 20, "Medical physics": 21, "Nuclear medicine": 22, "Nursing": 23, "Obstetrics": 24, "Oncology": 25, "Operations management": 26, "Ophthalmology": 27, "Optometry": 28, "Orthodontics": 29, "Pathology": 30, "Pediatrics": 31, "Pharmacology": 32, "Physical medicine and rehabilitation": 33, "Physical therapy": 34, "Physiology": 35, "Psychiatry": 36, "Radiology": 37, "Surgery": 38, "Traditional medicine": 39, "Urology": 40,
+    # Biology (41-58) - 13% of data
+    "Agronomy": 41, "Andrology": 42, "Biotechnology": 43, "Botany": 44, "Cancer research": 45, "Cell biology": 46, "Computational biology": 47, "Ecology": 48, "Endocrinology": 49, "Evolutionary biology": 50, "Genetics": 51, "Horticulture": 52, "Microbiology": 53, "Molecular biology": 54, "Toxicology": 55, "Veterinary medicine": 56, "Virology": 57, "Zoology": 58,
+    # Psychology (59-72) - 11% of data
+    "Applied psychology": 59, "Audiology": 60, "Clinical psychology": 61, "Cognitive psychology": 62, "Cognitive science": 63, "Communication": 64, "Criminology": 65, "Developmental psychology": 66, "Linguistics": 67, "Mathematics education": 68, "Neuroscience": 69, "Psychoanalysis": 70, "Psychotherapist": 71, "Social psychology": 72,
+    # Computer science (73-126) - 9% of data
+    "Acoustics": 73, "Algorithm": 74, "Arithmetic": 75, "Artificial intelligence": 76, "Automotive engineering": 77, "Biochemical engineering": 78, "Biological system": 79, "Computational science": 80, "Computer architecture": 81, "Computer engineering": 82, "Computer graphics (images)": 83, "Computer hardware": 84, "Computer network": 85, "Computer security": 86, "Computer vision": 87, "Control engineering": 88, "Data mining": 89, "Data science": 90, "Database": 91, "Distributed computing": 92, "Electrical engineering": 93, "Electronic engineering": 94, "Embedded system": 95, "Engineering drawing": 96, "Engineering management": 97, "Human–computer interaction": 98, "Industrial engineering": 99, "Information retrieval": 100, "Internet privacy": 101, "Knowledge management": 102, "Machine learning": 103, "Management science": 104, "Manufacturing engineering": 105, "Mathematical optimization": 106, "Mechanical engineering": 107, "Multimedia": 108, "Natural language processing": 109, "Operating system": 110, "Operations research": 111, "Parallel computing": 112, "Process engineering": 113, "Programming language": 114, "Real-time computing": 115, "Reliability engineering": 116, "Remote sensing": 117, "Risk analysis (engineering)": 118, "Simulation": 119, "Software engineering": 120, "Speech recognition": 121, "Systems engineering": 122, "Telecommunications": 123, "Theoretical computer science": 124, "Transport engineering": 125, "World Wide Web": 126,
+    # Chemistry (127-146) - 6% of data
+    "Biochemistry": 127, "Biophysics": 128, "Chromatography": 129, "Combinatorial chemistry": 130, "Computational chemistry": 131, "Crystallography": 132, "Food science": 133, "Inorganic chemistry": 134, "Medicinal chemistry": 135, "Molecular physics": 136, "Nuclear chemistry": 137, "Nuclear magnetic resonance": 138, "Organic chemistry": 139, "Photochemistry": 140, "Physical chemistry": 141, "Polymer chemistry": 142, "Pulp and paper industry": 143, "Radiochemistry": 144, "Stereochemistry": 145, "Thermodynamics": 146,
+    # Physics (147-162) - 7% of data
+    "Aerospace engineering": 147, "Astrobiology": 148, "Astronomy": 149, "Astrophysics": 150, "Atomic physics": 151, "Classical mechanics": 152, "Computational physics": 153, "Geophysics": 154, "Mathematical physics": 155, "Mechanics": 156, "Nuclear physics": 157, "Particle physics": 158, "Quantum electrodynamics": 159, "Quantum mechanics": 160, "Statistical physics": 161, "Theoretical physics": 162,
+    # Materials science (163-175) - 7% of data
+    "Biomedical engineering": 163, "Chemical engineering": 164, "Chemical physics": 165, "Composite material": 166, "Condensed matter physics": 167, "Engineering physics": 168, "Metallurgy": 169, "Nanotechnology": 170, "Nuclear engineering": 171, "Optics": 172, "Optoelectronics": 173, "Polymer science": 174, "Structural engineering": 175,
+    # Sociology (176-187) - 2% of data
+    "Aesthetics": 176, "Anthropology": 177, "Engineering ethics": 178, "Environmental ethics": 179, "Epistemology": 180, "Gender studies": 181, "Management": 182, "Media studies": 183, "Pedagogy": 184, "Positive economics": 185, "Religious studies": 186, "Social science": 187,
+    # Geology (188-199) - 1% of data
+    "Earth science": 188, "Geochemistry": 189, "Geodesy": 190, "Geomorphology": 191, "Geotechnical engineering": 192, "Mineralogy": 193, "Mining engineering": 194, "Oceanography": 195, "Paleontology": 196, "Petrology": 197, "Physical geography": 198, "Seismology": 199,
+    # Mathematics (200-206) - 1.5% of data
+    "Applied mathematics": 200, "Combinatorics": 201, "Discrete mathematics": 202, "Geometry": 203, "Mathematical analysis": 204, "Pure mathematics": 205, "Statistics": 206,
+    # Political science (207-215) - 2% of data
+    "Development economics": 207, "Economic growth": 208, "Economic history": 209, "Economy": 210, "Law": 211, "Law and economics": 212, "Political economy": 213, "Public administration": 214, "Public relations": 215,
+    # Business (216-231) - 1% of data
+    "Accounting": 216, "Actuarial science": 217, "Advertising": 218, "Agricultural economics": 219, "Agricultural science": 220, "Business administration": 221, "Commerce": 222, "Environmental economics": 223, "Environmental planning": 224, "Finance": 225, "Financial system": 226, "Industrial organization": 227, "International trade": 228, "Marketing": 229, "Natural resource economics": 230, "Process management": 231,
+    # Geography (232-240) - 1% of data
+    "Agroforestry": 232, "Archaeology": 233, "Cartography": 234, "Economic geography": 235, "Environmental resource management": 236, "Fishery": 237, "Forestry": 238, "Regional science": 239, "Socioeconomics": 240,
+    # Environmental science (241-251) - 0.7% of data
+    "Agricultural engineering": 241, "Atmospheric sciences": 242, "Climatology": 243, "Environmental chemistry": 244, "Environmental engineering": 245, "Environmental protection": 246, "Meteorology": 247, "Petroleum engineering": 248, "Soil science": 249, "Waste management": 250, "Water resource management": 251,
+    # Economics (252-268) - 1% of data
+    "Classical economics": 252, "Demographic economics": 253, "Econometrics": 254, "Economic policy": 255, "Economic system": 256, "Financial economics": 257, "International economics": 258, "Keynesian economics": 259, "Labour economics": 260, "Macroeconomics": 261, "Market economy": 262, "Mathematical economics": 263, "Microeconomics": 264, "Monetary economics": 265, "Neoclassical economics": 266, "Public economics": 267, "Welfare economics": 268,
+    # History (269-272) - 0.2% of data
+    "Ancient history": 269, "Classics": 270, "Ethnology": 271, "Genealogy": 272,
+    # Engineering (273-278) - 0.3% of data
+    "Aeronautics": 273, "Architectural engineering": 274, "Civil engineering": 275, "Construction engineering": 276, "Forensic engineering": 277, "Marine engineering": 278,
+    # Art (279-282) - 0.6% of data
+    "Art history": 279, "Humanities": 280, "Literature": 281, "Visual arts": 282,
+    # Philosophy (283) - 0% of data
+    "Theology": 283,
+}
+
+
 def calculate_sizes_from_csv(psys_settings, num_particles):
     """
     Calculate particle sizes from CSV file using current settings.
@@ -160,10 +209,17 @@ def calculate_fields_from_csv(psys_settings, num_particles):
                         field_id = float(field_val)
                     except (ValueError, TypeError):
                         # String field name - convert to ID
-                        if field_val not in field_to_id:
-                            field_to_id[field_val] = next_field_id
-                            next_field_id += 1
-                        field_id = float(field_to_id[field_val])
+                        # Use grouped mapping for field_level_1 to cluster related fields
+                        if field_col == 'field_level_1' and field_val in GROUPED_FIELD_L1_IDS:
+                            field_id = float(GROUPED_FIELD_L1_IDS[field_val])
+                            if field_val not in field_to_id:
+                                field_to_id[field_val] = GROUPED_FIELD_L1_IDS[field_val]
+                        else:
+                            # Fallback to first-seen order for other columns or unknown fields
+                            if field_val not in field_to_id:
+                                field_to_id[field_val] = next_field_id
+                                next_field_id += 1
+                            field_id = float(field_to_id[field_val])
 
                     par_field[idx * 3] = field_id
                     par_field[idx * 3 + 1] = 0.0  # Y unused
@@ -420,10 +476,17 @@ def pack_data(context, initiate):
                                                 field_id = float(field_val)
                                             except (ValueError, TypeError):
                                                 # String field name - convert to ID
-                                                if field_val not in field_to_id:
-                                                    field_to_id[field_val] = next_field_id
-                                                    next_field_id += 1
-                                                field_id = float(field_to_id[field_val])
+                                                # Use grouped mapping for field_level_1 to cluster related fields
+                                                if field_col == 'field_level_1' and field_val in GROUPED_FIELD_L1_IDS:
+                                                    field_id = float(GROUPED_FIELD_L1_IDS[field_val])
+                                                    if field_val not in field_to_id:
+                                                        field_to_id[field_val] = GROUPED_FIELD_L1_IDS[field_val]
+                                                else:
+                                                    # Fallback to first-seen order for other columns or unknown fields
+                                                    if field_val not in field_to_id:
+                                                        field_to_id[field_val] = next_field_id
+                                                        next_field_id += 1
+                                                    field_id = float(field_to_id[field_val])
                                             par_field[idx*3] = field_id
                                             par_field[idx*3+1] = 0.0  # Y unused
                                             par_field[idx*3+2] = 0.0  # Z unused
