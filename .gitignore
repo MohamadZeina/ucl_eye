@@ -18,7 +18,9 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Renders (optional - comment out if you want to track renders)
-# *.png
-# *.jpg
-# *.exr
+# Renders and generated figures
+publication_galaxy_human/render/*.png
+publication_galaxy_human/render/*.jpg
+publication_galaxy_human/render/*.exr
+publication_galaxy_human/render/*.mp4
+publication_galaxy_human/render/*.mov

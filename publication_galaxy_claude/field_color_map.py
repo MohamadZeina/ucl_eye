@@ -217,6 +217,93 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
     print(f"Saved {output_path}")
 
 
+def generate_figure_linear(output_path="field_color_map_linear.png", dpi=150):
+    """Generate the legacy figure with linear temperature x-axis (pre-MIRED)."""
+    import numpy as np
+
+    linear_max = 35000
+
+    fig, (ax_spec, ax_cats) = plt.subplots(
+        2, 1, figsize=(16, 10),
+        gridspec_kw={'height_ratios': [1, 3]},
+        facecolor='#1a1a1a'
+    )
+
+    gradient = np.zeros((50, 1000, 3))
+    for x in range(1000):
+        temp = (x / 999) * linear_max
+        gradient[:, x] = blackbody_to_rgb(temp)
+    ax_spec.imshow(gradient, aspect='auto', extent=[0, linear_max, 0, 1])
+    ax_spec.set_xlim(0, linear_max)
+    ax_spec.set_xlabel('Black Body Temperature (K)', color='white', fontsize=12)
+    ax_spec.set_yticks([])
+    ax_spec.tick_params(colors='white')
+    ax_spec.set_facecolor('#1a1a1a')
+    ax_spec.set_title(
+        'UCL Eye: Academic Field \u2192 Black Body Color Mapping (Linear Scale)',
+        color='white', fontsize=16, fontweight='bold', pad=15
+    )
+
+    temps = [0, 5000, 10000, 15000, 20000, 25000, 30000, 35000]
+    ax_spec.set_xticks(temps)
+    ax_spec.set_xticklabels([f'{t // 1000}K' for t in temps], fontsize=10)
+
+    ax_cats.set_facecolor('#1a1a1a')
+    ax_cats.set_xlim(0, linear_max)
+    ax_cats.set_ylim(-0.5, len(CATEGORIES) - 0.5)
+    ax_cats.invert_yaxis()
+
+    for i, (fid_start, fid_end, name, pct) in enumerate(CATEGORIES):
+        t_start = field_id_to_temp(fid_start)
+        t_end = field_id_to_temp(fid_end)
+        t_lo, t_hi = min(t_start, t_end), max(t_start, t_end)
+        t_mid = (t_lo + t_hi) / 2
+        color = blackbody_to_rgb(t_mid)
+        bar_width = t_hi - t_lo
+
+        rect = mpatches.FancyBboxPatch(
+            (t_lo, i - 0.35), bar_width, 0.7,
+            boxstyle="round,pad=0.02",
+            facecolor=color, edgecolor='white', linewidth=0.5
+        )
+        ax_cats.add_patch(rect)
+
+        label_x = t_hi + 300
+        if label_x + 5000 > linear_max:
+            label_x = t_lo - 300
+            ha = 'right'
+        else:
+            ha = 'left'
+        ax_cats.text(
+            label_x, i, f'{name}  (IDs {fid_start}-{fid_end}, {pct})',
+            va='center', ha=ha, fontsize=9, color='white', fontweight='medium'
+        )
+
+        brightness = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        if bar_width > 2000:
+            text_color = 'black' if brightness > 0.5 else 'white'
+            ax_cats.text(
+                t_mid, i, f'{int(t_lo)}-{int(t_hi)}K',
+                va='center', ha='center', fontsize=7, color=text_color
+            )
+
+    ax_cats.set_yticks([])
+    ax_cats.set_xticks(temps)
+    ax_cats.set_xticklabels([f'{t // 1000}K' for t in temps], fontsize=10, color='white')
+    ax_cats.tick_params(colors='white')
+    ax_cats.set_xlabel('Black Body Temperature (K)', color='white', fontsize=12)
+
+    for spine in ax_spec.spines.values():
+        spine.set_color('#444')
+    for spine in ax_cats.spines.values():
+        spine.set_color('#444')
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, facecolor='#1a1a1a',
+                bbox_inches='tight', pad_inches=0.3)
+    print(f"Saved {output_path}")
+
+
 def print_table():
     """Print a text table of the MIRED mapping."""
     print(f"\n{'Field IDs':<12} {'Temp Range (K)':<20} {'Category':<18} {'RGB (mid)'}")
@@ -238,8 +325,13 @@ if __name__ == "__main__":
                         help="Output PNG path (default: field_color_map_labeled.png)")
     parser.add_argument("--dpi", type=int, default=150, help="Figure DPI (default: 150)")
     parser.add_argument("--table", action="store_true", help="Also print text table")
+    parser.add_argument("--linear", action="store_true",
+                        help="Also generate legacy linear-scale figure for comparison")
     args = parser.parse_args()
 
     generate_figure(args.output, args.dpi)
+    if args.linear:
+        linear_path = args.output.replace('.png', '_linear.png')
+        generate_figure_linear(linear_path, args.dpi)
     if args.table:
         print_table()
