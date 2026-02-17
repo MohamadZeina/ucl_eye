@@ -75,6 +75,20 @@ def field_id_to_temp(field_id):
     return 1.0 / mired
 
 
+def temp_to_x(temp):
+    """Convert temperature to x-axis position (MIRED-linear space).
+
+    x-axis is linear in field_id (= linear in MIRED), flipped so red is left.
+    x = MAX_FIELD - field_id, so x=0 → field 283 (800K, red), x=283 → field 0 (35000K, blue).
+    """
+    mired = 1.0 / temp
+    mired_min = 1.0 / T_MAX  # blue end
+    mired_max = 1.0 / T_MIN  # red end
+    frac = (mired - mired_min) / (mired_max - mired_min)  # 0 at blue, 1 at red
+    field_id = frac * MAX_FIELD
+    return MAX_FIELD - field_id  # flip: red=left (x=0), blue=right (x=283)
+
+
 # 19 parent categories sorted by frequency in dataset.
 # IDs match GROUPED_FIELD_L1_IDS in molecular-plus/simulate.py
 CATEGORIES = [
@@ -109,13 +123,18 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
         facecolor='#1a1a1a'
     )
 
-    # Top: continuous spectrum bar (red left, blue right)
+    # X-axis is linear in MIRED space (field_id), range [0, MAX_FIELD].
+    # x=0 → field 283 (T=800K, red, left), x=283 → field 0 (T=35000K, blue, right).
+
+    # Top: continuous spectrum bar sampled in MIRED space
     gradient = np.zeros((50, 1000, 3))
-    for x in range(1000):
-        temp = T_MIN + (x / 999) * (T_MAX - T_MIN)
-        gradient[:, x] = blackbody_to_rgb(temp)
-    ax_spec.imshow(gradient, aspect='auto', extent=[T_MIN, T_MAX, 0, 1])
-    ax_spec.set_xlim(T_MIN, T_MAX)
+    for px in range(1000):
+        x = (px / 999) * MAX_FIELD
+        field_id = MAX_FIELD - x  # x=0 → field 283 (red), x=283 → field 0 (blue)
+        temp = field_id_to_temp(field_id)
+        gradient[:, px] = blackbody_to_rgb(temp)
+    ax_spec.imshow(gradient, aspect='auto', extent=[0, MAX_FIELD, 0, 1])
+    ax_spec.set_xlim(0, MAX_FIELD)
     ax_spec.set_xlabel('Black Body Temperature (K)', color='white', fontsize=12)
     ax_spec.set_yticks([])
     ax_spec.tick_params(colors='white')
@@ -125,40 +144,42 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
         color='white', fontsize=16, fontweight='bold', pad=15
     )
 
-    temps = [1000, 5000, 10000, 15000, 20000, 25000, 30000, 35000]
-    ax_spec.set_xticks(temps)
-    ax_spec.set_xticklabels([f'{t // 1000}K' for t in temps], fontsize=10)
+    # Temperature tick labels at MIRED-spaced positions
+    tick_temps = [800, 1000, 1500, 2000, 3000, 5000, 10000, 20000, 35000]
+    tick_positions = [temp_to_x(t) for t in tick_temps]
+    tick_labels = [f'{t // 1000}K' if t >= 1000 else f'{t}' for t in tick_temps]
+    ax_spec.set_xticks(tick_positions)
+    ax_spec.set_xticklabels(tick_labels, fontsize=10)
 
-    # Bottom: category bars positioned by MIRED-mapped temperature
+    # Bottom: category bars in MIRED-linear space
     ax_cats.set_facecolor('#1a1a1a')
-    ax_cats.set_xlim(T_MIN, T_MAX)
+    ax_cats.set_xlim(0, MAX_FIELD)
     ax_cats.set_ylim(-0.5, len(CATEGORIES) - 0.5)
     ax_cats.invert_yaxis()
 
     for i, (fid_start, fid_end, name, pct) in enumerate(CATEGORIES):
-        # MIRED mapping: higher field IDs → lower temperatures (red)
-        t_start = field_id_to_temp(fid_start)  # higher T (bluer)
-        t_end = field_id_to_temp(fid_end)       # lower T (redder)
+        # Position in MIRED-linear x space (red=left, blue=right)
+        x_left = MAX_FIELD - fid_end     # red side of this category
+        x_right = MAX_FIELD - fid_start  # blue side of this category
+        bar_width = x_right - x_left
+        x_mid = (x_left + x_right) / 2
 
-        # Ensure t_lo < t_hi for bar positioning (left to right)
-        t_lo = min(t_start, t_end)
-        t_hi = max(t_start, t_end)
-        t_mid = (t_lo + t_hi) / 2
-        color = blackbody_to_rgb(t_mid)
+        # Color from midpoint temperature
+        mid_field_id = (fid_start + fid_end) / 2
+        temp_mid = field_id_to_temp(mid_field_id)
+        color = blackbody_to_rgb(temp_mid)
 
-        bar_width = t_hi - t_lo
         rect = mpatches.FancyBboxPatch(
-            (t_lo, i - 0.35), bar_width, 0.7,
+            (x_left, i - 0.35), bar_width, 0.7,
             boxstyle="round,pad=0.02",
             facecolor=color, edgecolor='white', linewidth=0.5
         )
         ax_cats.add_patch(rect)
 
         # Label to the right of the bar
-        label_x = t_hi + 300
-        # If bar extends to near the right edge, put label to the left instead
-        if label_x + 5000 > T_MAX:
-            label_x = t_lo - 300
+        label_x = x_right + 3
+        if label_x + 40 > MAX_FIELD:
+            label_x = x_left - 3
             ha = 'right'
         else:
             ha = 'left'
@@ -170,16 +191,18 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
 
         # Temperature label inside bar if wide enough
         brightness = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
-        if bar_width > 2000:
+        if bar_width > 15:
+            t_lo = int(min(field_id_to_temp(fid_start), field_id_to_temp(fid_end)))
+            t_hi = int(max(field_id_to_temp(fid_start), field_id_to_temp(fid_end)))
             text_color = 'black' if brightness > 0.5 else 'white'
             ax_cats.text(
-                t_mid, i, f'{int(t_lo)}-{int(t_hi)}K',
+                x_mid, i, f'{t_lo}-{t_hi}K',
                 va='center', ha='center', fontsize=7, color=text_color
             )
 
     ax_cats.set_yticks([])
-    ax_cats.set_xticks(temps)
-    ax_cats.set_xticklabels([f'{t // 1000}K' for t in temps], fontsize=10, color='white')
+    ax_cats.set_xticks(tick_positions)
+    ax_cats.set_xticklabels(tick_labels, fontsize=10, color='white')
     ax_cats.tick_params(colors='white')
     ax_cats.set_xlabel('Black Body Temperature (K)', color='white', fontsize=12)
 
