@@ -2,12 +2,24 @@
 """
 Generate the UCL Eye Academic Field → Black Body Color Mapping figure.
 
-Maps 284 field_level_1 categories (IDs 0-283) to blackbody temperatures (0-30,000K)
-and produces a labeled visualization showing the spectrum and category bands.
+Maps 284 field_level_1 categories (IDs 0-283) to blackbody temperatures
+using MIRED (reciprocal temperature) scaling for better perceptual distribution.
+
+MIRED mapping:
+    frac = field_id / 283
+    mired = 1/T_max + frac * (1/T_min - 1/T_max)
+    T = 1 / mired
+
+This spreads categories more evenly across the visible blackbody spectrum
+instead of cramming everything into the blue end. Side effect: the mapping
+is flipped — low field IDs (Medicine) map to blue, high IDs (Philosophy) to red.
+
+T_min = 800K (avoids near-zero division), T_max = 35000K.
 
 Output: field_color_map_labeled.png
 
 Originally created in session c240463d (Feb 11, 2026).
+MIRED scaling added Feb 17, 2026.
 """
 
 import math
@@ -43,6 +55,26 @@ def blackbody_to_rgb(temp_k):
     return (r / 255, g / 255, b / 255)
 
 
+# MIRED scaling parameters
+T_MIN = 800      # Minimum temperature (K) — avoids division-by-zero, tuned for look
+T_MAX = 35000    # Maximum temperature (K)
+MAX_FIELD = 283  # Highest field ID
+
+
+def field_id_to_temp(field_id):
+    """Convert field ID (0-283) to blackbody temperature using MIRED scaling.
+
+    Linear interpolation in reciprocal-temperature (MIRED) space:
+        mired = 1/T_max + (field_id/283) * (1/T_min - 1/T_max)
+        T = 1/mired
+
+    This flips the mapping: field 0 → T_max (blue), field 283 → T_min (red).
+    """
+    frac = field_id / MAX_FIELD
+    mired = 1.0 / T_MAX + frac * (1.0 / T_MIN - 1.0 / T_MAX)
+    return 1.0 / mired
+
+
 # 19 parent categories sorted by frequency in dataset.
 # IDs match GROUPED_FIELD_L1_IDS in molecular-plus/simulate.py
 CATEGORIES = [
@@ -67,9 +99,6 @@ CATEGORIES = [
     (283, 283, "Philosophy", "~0%"),
 ]
 
-MAX_FIELD = 283
-MAX_TEMP = 30000
-
 
 def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
     import numpy as np
@@ -80,60 +109,71 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
         facecolor='#1a1a1a'
     )
 
-    # Top: continuous spectrum bar
+    # Top: continuous spectrum bar (red left, blue right)
     gradient = np.zeros((50, 1000, 3))
     for x in range(1000):
-        temp = (x / 999) * MAX_TEMP
+        temp = T_MIN + (x / 999) * (T_MAX - T_MIN)
         gradient[:, x] = blackbody_to_rgb(temp)
-    ax_spec.imshow(gradient, aspect='auto', extent=[0, MAX_TEMP, 0, 1])
-    ax_spec.set_xlim(0, MAX_TEMP)
+    ax_spec.imshow(gradient, aspect='auto', extent=[T_MIN, T_MAX, 0, 1])
+    ax_spec.set_xlim(T_MIN, T_MAX)
     ax_spec.set_xlabel('Black Body Temperature (K)', color='white', fontsize=12)
     ax_spec.set_yticks([])
     ax_spec.tick_params(colors='white')
     ax_spec.set_facecolor('#1a1a1a')
     ax_spec.set_title(
-        'UCL Eye: Academic Field \u2192 Black Body Color Mapping',
+        'UCL Eye: Academic Field \u2192 Black Body Color Mapping (MIRED Scale)',
         color='white', fontsize=16, fontweight='bold', pad=15
     )
 
-    temps = [0, 5000, 10000, 15000, 20000, 25000, 30000]
+    temps = [1000, 5000, 10000, 15000, 20000, 25000, 30000, 35000]
     ax_spec.set_xticks(temps)
     ax_spec.set_xticklabels([f'{t // 1000}K' for t in temps], fontsize=10)
 
-    # Bottom: category bars
+    # Bottom: category bars positioned by MIRED-mapped temperature
     ax_cats.set_facecolor('#1a1a1a')
-    ax_cats.set_xlim(0, MAX_TEMP)
+    ax_cats.set_xlim(T_MIN, T_MAX)
     ax_cats.set_ylim(-0.5, len(CATEGORIES) - 0.5)
     ax_cats.invert_yaxis()
 
     for i, (fid_start, fid_end, name, pct) in enumerate(CATEGORIES):
-        t_start = (fid_start / MAX_FIELD) * MAX_TEMP
-        t_end = (fid_end / MAX_FIELD) * MAX_TEMP
-        t_mid = (t_start + t_end) / 2
+        # MIRED mapping: higher field IDs → lower temperatures (red)
+        t_start = field_id_to_temp(fid_start)  # higher T (bluer)
+        t_end = field_id_to_temp(fid_end)       # lower T (redder)
+
+        # Ensure t_lo < t_hi for bar positioning (left to right)
+        t_lo = min(t_start, t_end)
+        t_hi = max(t_start, t_end)
+        t_mid = (t_lo + t_hi) / 2
         color = blackbody_to_rgb(t_mid)
 
-        bar_width = t_end - t_start
+        bar_width = t_hi - t_lo
         rect = mpatches.FancyBboxPatch(
-            (t_start, i - 0.35), bar_width, 0.7,
+            (t_lo, i - 0.35), bar_width, 0.7,
             boxstyle="round,pad=0.02",
             facecolor=color, edgecolor='white', linewidth=0.5
         )
         ax_cats.add_patch(rect)
 
         # Label to the right of the bar
-        label_x = t_end + 200
-        brightness = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        label_x = t_hi + 300
+        # If bar extends to near the right edge, put label to the left instead
+        if label_x + 5000 > T_MAX:
+            label_x = t_lo - 300
+            ha = 'right'
+        else:
+            ha = 'left'
 
         ax_cats.text(
             label_x, i, f'{name}  (IDs {fid_start}-{fid_end}, {pct})',
-            va='center', ha='left', fontsize=9, color='white', fontweight='medium'
+            va='center', ha=ha, fontsize=9, color='white', fontweight='medium'
         )
 
         # Temperature label inside bar if wide enough
+        brightness = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
         if bar_width > 2000:
             text_color = 'black' if brightness > 0.5 else 'white'
             ax_cats.text(
-                t_mid, i, f'{int(t_start)}-{int(t_end)}K',
+                t_mid, i, f'{int(t_lo)}-{int(t_hi)}K',
                 va='center', ha='center', fontsize=7, color=text_color
             )
 
@@ -155,15 +195,16 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
 
 
 def print_table():
-    """Print a text table of the mapping."""
+    """Print a text table of the MIRED mapping."""
     print(f"\n{'Field IDs':<12} {'Temp Range (K)':<20} {'Category':<18} {'RGB (mid)'}")
     print("-" * 75)
     for fid_start, fid_end, name, pct in CATEGORIES:
-        t_start = int((fid_start / MAX_FIELD) * MAX_TEMP)
-        t_end = int((fid_end / MAX_FIELD) * MAX_TEMP)
-        t_mid = (t_start + t_end) // 2
+        t_start = field_id_to_temp(fid_start)
+        t_end = field_id_to_temp(fid_end)
+        t_lo, t_hi = min(t_start, t_end), max(t_start, t_end)
+        t_mid = (t_lo + t_hi) / 2
         r, g, b = blackbody_to_rgb(t_mid)
-        print(f"{fid_start:>3}-{fid_end:<8} {t_start:>5} - {t_end:<13} {name:<18} "
+        print(f"{fid_start:>3}-{fid_end:<8} {int(t_lo):>5} - {int(t_hi):<13} {name:<18} "
               f"({int(r * 255):>3}, {int(g * 255):>3}, {int(b * 255):>3})")
 
 
