@@ -57,7 +57,7 @@ def blackbody_to_rgb(temp_k):
 
 # MIRED scaling parameters
 T_MIN = 800      # Minimum temperature (K) — avoids division-by-zero, tuned for look
-T_MAX = 35000    # Maximum temperature (K)
+T_MAX = 60000    # Maximum temperature (K)
 MAX_FIELD = 283  # Highest field ID
 
 
@@ -145,7 +145,7 @@ def generate_figure(output_path="field_color_map_labeled.png", dpi=150):
     )
 
     # Temperature tick labels at MIRED-spaced positions
-    tick_temps = [800, 1000, 1500, 2000, 3000, 5000, 10000, 20000, 35000]
+    tick_temps = [800, 1000, 1500, 2000, 3000, 5000, 10000, 20000, 60000]
     tick_positions = [temp_to_x(t) for t in tick_temps]
     tick_labels = [f'{t // 1000}K' if t >= 1000 else f'{t}' for t in tick_temps]
     ax_spec.set_xticks(tick_positions)

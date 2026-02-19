@@ -18,9 +18,29 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Large data files
+data/
+
+# Blender scene files (large binaries)
+*.blend
+
 # Renders and generated figures
 publication_galaxy_human/render/*.png
 publication_galaxy_human/render/*.jpg
 publication_galaxy_human/render/*.exr
 publication_galaxy_human/render/*.mp4
 publication_galaxy_human/render/*.mov
+
+# Render test output directories
+publication_galaxy_human/render/9_8K_balls_loop_test_*/
+publication_galaxy_human/render/10_8K_balls_loop_test_*/
+publication_galaxy_human/render/DPX_test/
+publication_galaxy_human/render/6 - */
+publication_galaxy_human/render/8 - */
+
+# Crossover render outputs (frames and videos)
+publication_galaxy_human/render/crossover/*.mp4
+publication_galaxy_human/render/crossover/9_8K_*/
+publication_galaxy_human/render/crossover/10_8K_*/
+publication_galaxy_human/render/crossover/13_real_*/
+publication_galaxy_human/render/crossover/15_real_*/
