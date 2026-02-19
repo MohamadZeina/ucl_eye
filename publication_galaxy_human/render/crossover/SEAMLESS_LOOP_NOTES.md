@@ -7,8 +7,11 @@ Creating seamlessly looping videos of particle simulations where the particles d
 ## The Solution: Forward/Backward Camera Technique
 
 We render two camera passes on the same circular orbit path:
-- **Forward camera**: `100 * (frame / orbit_period)` - orbits clockwise
-- **Backward camera**: `100 * (-frame / orbit_period)` - orbits counter-clockwise
+- **Forward camera**: `100 * ((frame - 4) / 65536) + 2.8037` - orbits clockwise
+- **Backward camera**: `100 * (-(frame - 4) / 65536) + 2.8037` - orbits counter-clockwise
+
+The `- 4` shifts meeting frames to {4, 32772, 65540} (avoiding frame 0/2 artefacts).
+The `+ 2.8037` is a phase offset that rotates the visual crossover position on the orbit by ~2.8% (~10°) without changing which simulation frames the cameras meet at.
 
 The cameras meet at exactly two points:
 - **0% position** (frame 0, 60000, etc.) - the starting point
@@ -143,20 +146,45 @@ To change where on the orbit the crossover happens (without changing which simul
 
 ```
 # Original (crossover at 0% and 50% of orbit visually)
-100 * (frame / 60000)
+100 * ((frame - 4) / 65536)
 
-# With 90° phase offset (crossover at 25% and 75% of orbit visually)
-100 * ((frame + 15000) / 60000)
+# With phase offset (rotates visual crossover position)
+100 * ((frame - 4) / 65536) + phase_offset
 
 # General formula
-100 * ((frame + offset) / 60000)
+100 * ((frame - N) / period) + phase_offset
 ```
 
 Apply the same offset to both cameras:
-- Forward: `100 * ((frame + offset) / 60000)`
-- Backward: `100 * (-(frame + offset) / 60000)`
+- Forward: `100 * ((frame - 4) / 65536) + 2.8037`
+- Backward: `100 * (-(frame - 4) / 65536) + 2.8037`
 
-The cameras still meet at the same simulation frames (0, 30000, 60000), but the visual position on the orbit where they meet shifts by `offset/60000 * 360°`.
+The cameras still meet at the same simulation frames {4, 32772, 65540}, but the visual position on the orbit where they meet shifts by `phase_offset / 100 * 360°` (2.8037% ≈ 10°).
+
+## Shifting Meeting Frames (Skip Artefacts)
+
+If certain simulation frames have rendering artefacts (e.g., frame 0 or 2), you can shift which frames the cameras meet at using a **negative** offset:
+
+```
+# Original: cameras meet at frames 0, period/2, period
+Forward:  100 * (frame / period)
+Backward: 100 * (-frame / period)
+
+# Shifted by N frames: cameras meet at frames N, period/2 + N, period + N
+Forward:  100 * ((frame - N) / period)
+Backward: 100 * (-(frame - N) / period)
+```
+
+**Example**: To skip frame 2 artefact with period 65536, plus visual phase offset:
+- Forward: `100 * ((frame - 4) / 65536) + 2.8037`
+- Backward: `100 * (-(frame - 4) / 65536) + 2.8037`
+
+This shifts meeting frames from {0, 32768, 65536} to {4, 32772, 65540}.
+
+**Key**: Both formulas use subtraction (minus N). This ensures:
+- At frame 4: both cameras are at position 0% (meet)
+- At frame 32772: both cameras are at position 50% (meet)
+- At frame 65540: both cameras are at position 100%/0% (meet, loop point)
 
 ## Future Improvements
 
@@ -164,6 +192,62 @@ The cameras still meet at the same simulation frames (0, 30000, 60000), but the 
 2. **Motion blur consideration**: Disabled motion blur may help reduce artefacts
 3. **Blend at crossover**: Could implement frame blending at splice point for smoother transition
 4. **Clear output directory**: Script should optionally clear output before copying
+
+---
+
+## Render Performance Benchmarks (January 2026)
+
+### Hardware
+- **Machine**: Mac Studio M3 Ultra (512GB RAM)
+- **GPU**: M3 Ultra integrated GPU
+- **Baseline single render**: ~11.0-11.5s/frame
+
+### Concurrent Render Scaling
+
+| Config | Interval | f/min | f/day | Parallel Eff | TB/day |
+|--------|----------|-------|-------|--------------|--------|
+| 1 (baseline) | 11.0s | 5.5 | 7,855 | 100% | 1.07 |
+| 2 concurrent | 6.2s | 9.7 | 13,935 | 93% | 1.90 |
+| 3 concurrent | 5.2s | 11.5 | 16,615 | 74% | 2.26 |
+| 4 concurrent | 4.4s | 13.6 | 19,636 | 65% | 2.67 |
+| 5 concurrent | 5.9s | 10.2 | 14,644 | 39% | 1.99 |
+
+**Key finding**: 4 concurrent is optimal. 5 concurrent causes GPU contention and is slower than 4.
+
+### Drive Performance Impact
+
+The same drive in different enclosures showed dramatic performance differences:
+
+| Enclosure | Rate | Effective Concurrent | TB/day |
+|-----------|------|---------------------|--------|
+| USB2 enclosure (~40 MB/s) | 10.5s/f | 1.9 of 3 | 1.12 |
+| TerraMaster D4 DAS (40 Gbps) | 4.3s/f | 2.7 of 3 | 2.73 |
+| **D4 DAS with 4 concurrent** | **3.8s/f** | **3.1 of 4** | **3.13** |
+| D4 DAS with 5 concurrent | 4.3s/f | 2.7 of 5 | 2.74 |
+
+**Key findings**:
+- USB2 enclosure was severe bottleneck. Same drive in USB4/TB3 DAS achieved **2.4x faster** render throughput. The drive wasn't slow - the enclosure was.
+- **4 concurrent on D4 DAS is optimal** (3.8s/f, 3.13 TB/day, 23K frames/day)
+- 5 concurrent provides no benefit - GPU saturated at 4
+
+### Storage Requirements
+
+Per-frame sizes:
+- JPG only: ~10 MB
+- EXR (multi-layer): ~126 MB
+- Combined: ~136 MB/frame
+
+For 130K frames (full FW+BW passes):
+- JPG only: 1.3 TB
+- JPG + EXR: 17.7 TB
+
+### Write Bandwidth Requirements
+
+At 4 concurrent @ 4.4s/frame with JPG+EXR:
+- Burst: ~544 MB every 4.4s = 124 MB/s peak
+- USB2 capacity: ~40 MB/s (bottleneck!)
+- USB 3.1: ~400 MB/s (3.2x headroom)
+- USB 3.2/TB3: ~800+ MB/s (adequate)
 
 ---
 

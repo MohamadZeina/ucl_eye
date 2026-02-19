@@ -7,10 +7,10 @@ Creates a seamless loop by combining:
 2. Backward pass REVERSED: crossover_frame-step → start_frame (simulation backward)
 
 The cameras use drivers:
-- Forward:  100 * (frame / orbit_period)
-- Backward: 100 * (-frame / orbit_period)
+- Forward:  100 * ((frame - 4) / 65536) + 2.8037
+- Backward: 100 * (-(frame - 4) / 65536) + 2.8037
 
-They meet at crossover = orbit_period / 2
+They meet at frames {4, 32772, 65540} (crossover at 0% and 50% of orbit)
 """
 
 import os
@@ -18,6 +18,40 @@ import shutil
 import argparse
 import subprocess
 from pathlib import Path
+
+
+# Resolution presets (width x height)
+RESOLUTION_PRESETS = {
+    '8K': (7680, 4320),
+    '4K': (3840, 2160),
+    '2K': (2560, 1440),
+    '1080p': (1920, 1080),
+    '720p': (1280, 720),
+}
+
+
+def parse_resolution(res_str: str) -> tuple[int, int] | None:
+    """Parse resolution string like '4K', '1080p', or '1920x1080'."""
+    if not res_str:
+        return None
+    res_upper = res_str.upper()
+    if res_upper in RESOLUTION_PRESETS:
+        return RESOLUTION_PRESETS[res_upper]
+    if 'X' in res_upper:
+        parts = res_upper.split('X')
+        if len(parts) == 2:
+            try:
+                return (int(parts[0]), int(parts[1]))
+            except ValueError:
+                pass
+    raise ValueError(f"Invalid resolution: {res_str}. Use preset (4K, 1080p) or WxH format.")
+
+
+def filter_frames_by_step(frames: list[int], step: int, start_offset: int = 4) -> list[int]:
+    """Filter frame list to only include frames at consistent step intervals."""
+    expected = set(range(start_offset, max(frames) + 1, step))
+    filtered = [f for f in frames if f in expected]
+    return sorted(filtered)
 
 
 def get_frame_list(directory: Path, extension: str = ".jpg") -> list[int]:
@@ -157,10 +191,18 @@ def create_video(
     output_file: Path,
     fps: int = 24,
     extension: str = ".jpg",
-    crf: int = 18
+    crf: int = 18,
+    resolution: tuple[int, int] | None = None
 ):
-    """Create video from frame sequence using ffmpeg."""
-    cmd = [
+    """
+    Create video from frame sequence using ffmpeg.
+
+    If resolution is specified, creates BOTH:
+    - Native resolution video (original filename)
+    - Downscaled video (with resolution suffix, e.g., _4K.mp4)
+    """
+    # Always create native resolution first
+    cmd_native = [
         'ffmpeg', '-y',
         '-framerate', str(fps),
         '-i', str(input_dir / f'%04d{extension}'),
@@ -172,9 +214,42 @@ def create_video(
         str(output_file)
     ]
 
-    print(f"Creating video: {output_file}")
-    subprocess.run(cmd, check=True)
+    print(f"Creating video (native): {output_file}")
+    subprocess.run(cmd_native, check=True)
     print(f"Video created: {output_file}")
+
+    # If resolution specified, also create downscaled version
+    if resolution:
+        width, height = resolution
+        # Generate resolution suffix
+        res_name = None
+        for name, (w, h) in RESOLUTION_PRESETS.items():
+            if w == width and h == height:
+                res_name = name
+                break
+        if not res_name:
+            res_name = f"{width}x{height}"
+
+        # Create scaled output filename
+        stem = output_file.stem
+        scaled_file = output_file.with_name(f"{stem}_{res_name}{output_file.suffix}")
+
+        cmd_scaled = [
+            'ffmpeg', '-y',
+            '-framerate', str(fps),
+            '-i', str(input_dir / f'%04d{extension}'),
+            '-c:v', 'libx264',
+            '-preset', 'medium',
+            '-crf', str(crf),
+            '-pix_fmt', 'yuv420p',
+            '-vf', f'scale={width}:{height}:flags=lanczos',
+            '-movflags', '+faststart',
+            str(scaled_file)
+        ]
+
+        print(f"Creating video ({res_name}): {scaled_file}")
+        subprocess.run(cmd_scaled, check=True)
+        print(f"Video created: {scaled_file}")
 
 
 def stitch_both_crossovers(
@@ -185,7 +260,8 @@ def stitch_both_crossovers(
     extension: str = ".jpg",
     fps: int = 24,
     dry_run: bool = False,
-    skip_crossover: bool = True
+    skip_crossover: bool = True,
+    resolution: tuple[int, int] | None = None
 ) -> dict:
     """
     Create videos for BOTH crossover points:
@@ -222,7 +298,7 @@ def stitch_both_crossovers(
     )
 
     if not dry_run:
-        create_video(output_dir_1, video_1, fps=fps, extension=extension)
+        create_video(output_dir_1, video_1, fps=fps, extension=extension, resolution=resolution)
 
     # Crossover 2: At start point (0% / 100%)
     # Target is orbit_period (60000) where cameras meet at 0%
@@ -248,7 +324,7 @@ def stitch_both_crossovers(
     )
 
     if not dry_run:
-        create_video(output_dir_2, video_2, fps=fps, extension=extension)
+        create_video(output_dir_2, video_2, fps=fps, extension=extension, resolution=resolution)
 
     return results
 
@@ -268,40 +344,95 @@ def main():
                         help='Generate videos for both crossover points (50%% and 0%%)')
     parser.add_argument('--no-skip-crossover', action='store_true',
                         help='Include crossover frame in both sequences (creates 1-frame pause at splice)')
+    parser.add_argument('--step', type=int,
+                        help='Filter frames to consistent step interval (e.g., 1024, 2048)')
+    parser.add_argument('--resolution', type=str,
+                        help='Also create downscaled video (e.g., 4K, 1080p, 1920x1080). Native always saved.')
 
     args = parser.parse_args()
     skip_crossover = not args.no_skip_crossover
+    resolution = parse_resolution(args.resolution) if args.resolution else None
 
-    if args.both_crossovers:
-        # Generate both crossover videos
-        results = stitch_both_crossovers(
-            fw_dir=args.fw_dir,
-            bw_dir=args.bw_dir,
-            output_base=args.output_dir,
-            orbit_period=args.orbit_period,
-            extension=args.extension,
-            fps=args.fps,
-            dry_run=args.dry_run,
-            skip_crossover=skip_crossover
-        )
-        return results
-    else:
-        # Single crossover (original behavior)
-        stats = stitch_loop(
-            fw_dir=args.fw_dir,
-            bw_dir=args.bw_dir,
-            output_dir=args.output_dir,
-            orbit_period=args.orbit_period,
-            crossover_frame=args.crossover,
-            extension=args.extension,
-            dry_run=args.dry_run,
-            skip_crossover=skip_crossover
-        )
+    # If step filtering requested, create filtered temp directories
+    fw_dir = args.fw_dir
+    bw_dir = args.bw_dir
+    temp_dirs = []
 
-        if args.video and not args.dry_run:
-            create_video(args.output_dir, args.video, fps=args.fps, extension=args.extension)
+    if args.step:
+        import tempfile
+        # Get frames from both directories
+        fw_frames = get_frame_list(args.fw_dir, args.extension)
+        bw_frames = get_frame_list(args.bw_dir, args.extension)
 
-        return stats
+        # Find common frames
+        common_frames = sorted(set(fw_frames) & set(bw_frames))
+
+        # Detect start offset from first frame
+        start_offset = common_frames[0] if common_frames else 0
+
+        # Filter to consistent step
+        filtered_frames = filter_frames_by_step(common_frames, args.step, start_offset)
+
+        if not filtered_frames:
+            raise ValueError(f"No frames found at step {args.step}")
+
+        print(f"Filtering to step {args.step}: {len(filtered_frames)} frames "
+              f"(from {len(common_frames)} common frames)")
+
+        # Create temp directories with symlinks to filtered frames
+        fw_temp = Path(tempfile.mkdtemp(prefix='stitch_fw_'))
+        bw_temp = Path(tempfile.mkdtemp(prefix='stitch_bw_'))
+        temp_dirs = [fw_temp, bw_temp]
+
+        for frame in filtered_frames:
+            fw_src = args.fw_dir / f"{frame:04d}{args.extension}"
+            bw_src = args.bw_dir / f"{frame:04d}{args.extension}"
+            if fw_src.exists():
+                (fw_temp / f"{frame:04d}{args.extension}").symlink_to(fw_src)
+            if bw_src.exists():
+                (bw_temp / f"{frame:04d}{args.extension}").symlink_to(bw_src)
+
+        fw_dir = fw_temp
+        bw_dir = bw_temp
+
+    try:
+        if args.both_crossovers:
+            # Generate both crossover videos
+            results = stitch_both_crossovers(
+                fw_dir=fw_dir,
+                bw_dir=bw_dir,
+                output_base=args.output_dir,
+                orbit_period=args.orbit_period,
+                extension=args.extension,
+                fps=args.fps,
+                dry_run=args.dry_run,
+                skip_crossover=skip_crossover,
+                resolution=resolution
+            )
+            return results
+        else:
+            # Single crossover (original behavior)
+            stats = stitch_loop(
+                fw_dir=fw_dir,
+                bw_dir=bw_dir,
+                output_dir=args.output_dir,
+                orbit_period=args.orbit_period,
+                crossover_frame=args.crossover,
+                extension=args.extension,
+                dry_run=args.dry_run,
+                skip_crossover=skip_crossover
+            )
+
+            if args.video and not args.dry_run:
+                create_video(args.output_dir, args.video, fps=args.fps, extension=args.extension,
+                             resolution=resolution)
+
+            return stats
+    finally:
+        # Clean up temp directories
+        for temp_dir in temp_dirs:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir)
 
 
 if __name__ == '__main__':

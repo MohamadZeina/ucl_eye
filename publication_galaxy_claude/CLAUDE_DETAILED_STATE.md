@@ -2,7 +2,7 @@
 
 Blender particle position control via Python. Successfully implemented frame handler approach to set particle positions and sizes from CSV coordinates. Also compiled Molecular Plus Cython core from source for custom physics modifications. Added TSNE computation pipeline for UCL scientific literature embeddings (370K papers) with 2D/3D coordinates and field hierarchy extraction.
 
-**Last updated**: 2026-01-09
+**Last updated**: 2026-02-07
 
 ---
 
@@ -36,6 +36,67 @@ Compile the Molecular Plus Cython (.pyx) files to enable custom physics modifica
 Compute TSNE dimensionality reduction for UCL scientific paper embeddings with robust metadata mapping.
 
 **Status**: SOLVED. Generated 2D and 3D TSNE for 8K, 64K, and full 370K paper datasets with field hierarchy.
+
+### Goal 4: Frame Integrity Verification 🟡 ANOMALY SCAN PHASE 2 — D1/D2 REMAINING
+Verify all ~130,000 rendered frames across 4 drives for corruption before final compositing.
+
+**Status (Feb 10 evening):**
+- **Phase 1 (scanline corruption)**: COMPLETE across all 4 drives. 34 scanline-corrupt frames on D3, all re-rendered and verified. D1/D2/D4: 0 scanline corruption.
+- **Phase 2 (subtle anomaly scan)**: Two-phase detection (file-size + oiiotool brightness/StdDev) found 152 flagged frames across all drives. Re-render and pixel-compare (old vs new) is the only reliable way to distinguish genuine corruption from natural scene variation.
+- **D4 BW**: 30 flagged → re-rendered → **2 genuinely corrupt (frames 45, 8936)**, 28 natural variation. DONE.
+- **D3 BW**: 72 flagged → re-rendered → **3 genuinely corrupt (frames 40683, 44325, 62178)**, 69 natural variation. DONE.
+- **D2 FW**: 46 flagged → PENDING re-render (forward camera).
+- **D1 FW**: 4 flagged → PENDING re-render (forward camera).
+- Old originals archived to NAS: `/Volumes/Datasets Toshibas/ucl_eye/render_soft_launch/` with SHA256 manifest.
+
+### Anomaly Detection Method
+1. **Phase 1 (fast)**: Index all file sizes, flag >0.1% deviation from ±5 rolling window neighbors
+2. **Phase 2 (targeted)**: `oiiotool --printstats` on flagged frames + ±3 neighbors, check brightness >0.5% and/or StdDev >0.4%
+3. **Definitive test**: Stage JPG+EXR, re-render, compare old vs new with `oiiotool --diff`. Clean frames: mean_err ~1e-05 (GPU noise). Corrupt frames: mean_err >> 1.0
+4. Ratio-based neighbor comparison (frame-vs-neighbor / baseline) is NOT reliable — ratios of 2-4x overlap between clean and corrupt frames
+
+### Corrupt Frames Found So Far (5 total)
+| Frame | Drive | mean_err (old vs new) | Nature |
+|-------|-------|-----------------------|--------|
+| 45 | D4 BW | 2.999e+07 | Zeros in Depth channel |
+| 8936 | D4 BW | 2.319e+01 | Data corruption |
+| 40683 | D3 BW | 3.200e+03 | Data corruption |
+| 44325 | D3 BW | 2.411e+03 | Data corruption |
+| 62178 | D3 BW | 1.523e+04 | Data corruption |
+
+### Known Corruption Types (Taxonomy)
+
+Five distinct types discovered across the 32-sample render. All apply to future renders too.
+
+| # | Type | Detection | Severity | Cause |
+|---|------|-----------|----------|-------|
+| 1 | **Scanline corruption** | `oiiotool --printstats` → "unable to compute" or "corrupt" | High — visible garbled lines | Disk I/O error or write interruption during EXR save |
+| 2 | **Camera flip** | `oiiotool --diff bw.exr fw.exr` → RMS < 0.01 = wrong camera | High — completely wrong frame | Blender bug: wrong camera active during batch render |
+| 3 | **Subtle data corruption** | Only detectable by re-rendering and comparing old vs new (`oiiotool --diff`, mean_err >> 1.0) | Medium — may or may not be visible | Unknown — possibly GPU memory errors or race conditions |
+| 4 | **Zero-size placeholders** | `os.path.getsize(f) == 0` | High — Blender skips these on restart, leaving permanent gaps | Blender crash or kill mid-frame write |
+| 5 | **JPG-only (missing EXR)** | JPG exists but corresponding EXR does not | Medium — frame looks rendered but no EXR for compositing | Blender output node issue; JPG written by one output, EXR output fails silently |
+
+**Key insight**: Types 1, 4, 5 are easy to detect automatically. Type 2 requires a reference frame from the other camera direction. Type 3 is the hardest — only detectable by re-rendering and pixel-comparing, which is expensive.
+
+**For the new 256-sample render (17_the_one, 4 concurrent):**
+- Types 4 and 5 are most likely with concurrent processes on one drive
+- Recommended: periodic monitoring script checking for zero-size files, JPG/EXR count mismatches, and frame gaps
+
+### Current Status (Feb 11)
+
+**Old 32-sample render**: D3/D4 fully verified (5 corrupt found and fixed). D2 (46 frames) and D1 (4 frames) staged but superseded by new render.
+
+**New 256-sample render (17_the_one)**:
+- Output: `/Volumes/Mo 4TB/render/17_the_one/` (JPG) + `17_the_one_EXR/` (EXR)
+- 4 concurrent Blender processes, ~32.5s/frame, ~480 frames/hr
+- Target: 131,072 frames, ETA ~12.3 days
+- Archival of old 32-sample render to NAS in progress (separate agent)
+
+### Next Steps
+1. Monitor new render for corruption types 4 and 5 (zero-size, missing EXR)
+2. After render complete: full integrity scan (types 1-5)
+3. Archive to NAS with SHA256 checksums
+4. Final DaVinci export
 
 ---
 
@@ -343,6 +404,85 @@ x,y,z,scale
 
 ---
 
+## COMPLETED: HERO TRACKER BLENDER ADDON
+
+### Purpose
+Track "hero" particles through Molecular Plus simulations by creating Empty objects that follow selected particles frame-by-frame. Enables camera tracking to specific particles for cinematic shots.
+
+### Location
+- **Source**: `/Users/mo/github/ucl_eye/hero_tracker/src/__init__.py`
+- **Installed**: `/Users/mo/Library/Application Support/Blender/4.5/scripts/addons/hero_tracker/`
+
+### Version History
+
+| Version | Features |
+|---------|----------|
+| v1.x-v2.x | Single camera tracking, basic baking |
+| v3.0.0 | Dual-camera support - processes both FW/BW cameras in single pass |
+| v3.1.0 | Frame stepping - evaluate every N frames, Blender interpolates |
+
+### Key Features
+
+**Dual-Camera Mode (v3.0.0)**:
+- Single "Bake Hero Keyframes" operation creates Empties for both forward and backward cameras
+- Each camera gets its own tracking empties (e.g., `hero_fw_0`, `hero_bw_0`)
+- Required for seamless loop rendering where cameras orbit in opposite directions
+
+**Frame Stepping (v3.1.0)**:
+- Property: `frame_step` (1 = every frame, higher = faster baking)
+- No hard limit on step size (soft_max=100 for UI convenience)
+- Step=N gives ~Nx faster baking (e.g., step=32 for 65536-frame simulations)
+- Blender interpolates between keyframes
+- Always includes final frame for clean loop closure
+
+### Failed Optimization Attempts (Documented)
+
+**v3.2.0 - Bulk keyframe insertion using `add()` + `.co`**:
+```python
+# BROKEN: 500x faster but empties don't follow particles
+fc.keyframe_points.add(n_keyframes)
+for i, (frame, value) in enumerate(keyframes):
+    fc.keyframe_points[i].co = (frame, value)
+fc.update()
+```
+- All keyframes start at frame 0, may get merged/collapsed
+- Animation visually broken despite keyframes being created
+
+**v3.2.1 - Using `insert()` method**:
+```python
+# BROKEN: Same speed as v3.1.0 and still broken
+fc.keyframe_points.insert(frame, value)
+```
+- Documented Blender API method
+- Still doesn't animate objects correctly
+
+**Lesson learned**: `object.keyframe_insert()` is slow but correct because it triggers full Blender updates. FCurve-level insertion is fast but doesn't properly register the animation. Use `frame_step` for speedups instead.
+
+### Usage
+
+1. Run Molecular Plus simulation with disk cache enabled
+2. In Hero Tracker panel:
+   - Select particle system
+   - Set particle indices to track (comma-separated)
+   - Set frame range and step size
+   - Click "Bake Hero Keyframes"
+3. Hero empties appear and follow particles through cached simulation
+4. Point camera Track To constraint at hero empties
+
+### Related: Seamless Loop Camera Drivers
+
+For seamless loops with power-of-2 period (e.g., 65536):
+```
+Forward:  100 * ((frame - offset) / period)
+Backward: 100 * (-(frame - offset) / period)
+```
+
+Meeting frames: {offset, period/2 + offset, period + offset}
+
+Use offset to skip artefact frames (e.g., offset=4 to skip frames 0-3).
+
+---
+
 ## CURRENT GOAL: BARNES-HUT GRAVITY SIMULATION (Goal 3)
 
 ### Objective
@@ -566,8 +706,653 @@ The original `tsne.ipynb` had a bug where `duplicate_indices` computed from one 
 
 ---
 
+## FIELD LEVEL 1 MAPPING (OpenAlex Concepts)
+
+The TSNE datasets use OpenAlex concept hierarchy. Below are the 284 unique `field_level_1` values, grouped by their primary `field_level_0` parent (based on most frequent occurrence in the UCL dataset).
+
+### Art (4 fields)
+- Art history
+- Humanities
+- Literature
+- Visual arts
+
+### Biology (18 fields)
+- Agronomy
+- Andrology
+- Biotechnology
+- Botany
+- Cancer research
+- Cell biology
+- Computational biology
+- Ecology
+- Endocrinology
+- Evolutionary biology
+- Genetics
+- Horticulture
+- Microbiology
+- Molecular biology
+- Toxicology
+- Veterinary medicine
+- Virology
+- Zoology
+
+### Business (16 fields)
+- Accounting
+- Actuarial science
+- Advertising
+- Agricultural economics
+- Agricultural science
+- Business administration
+- Commerce
+- Environmental economics
+- Environmental planning
+- Finance
+- Financial system
+- Industrial organization
+- International trade
+- Marketing
+- Natural resource economics
+- Process management
+
+### Chemistry (20 fields)
+- Biochemistry
+- Biophysics
+- Chromatography
+- Combinatorial chemistry
+- Computational chemistry
+- Crystallography
+- Food science
+- Inorganic chemistry
+- Medicinal chemistry
+- Molecular physics
+- Nuclear chemistry
+- Nuclear magnetic resonance
+- Organic chemistry
+- Photochemistry
+- Physical chemistry
+- Polymer chemistry
+- Pulp and paper industry
+- Radiochemistry
+- Stereochemistry
+- Thermodynamics
+
+### Computer science (54 fields)
+- Acoustics
+- Algorithm
+- Arithmetic
+- Artificial intelligence
+- Automotive engineering
+- Biochemical engineering
+- Biological system
+- Computational science
+- Computer architecture
+- Computer engineering
+- Computer graphics (images)
+- Computer hardware
+- Computer network
+- Computer security
+- Computer vision
+- Control engineering
+- Data mining
+- Data science
+- Database
+- Distributed computing
+- Electrical engineering
+- Electronic engineering
+- Embedded system
+- Engineering drawing
+- Engineering management
+- Human–computer interaction
+- Industrial engineering
+- Information retrieval
+- Internet privacy
+- Knowledge management
+- Machine learning
+- Management science
+- Manufacturing engineering
+- Mathematical optimization
+- Mechanical engineering
+- Multimedia
+- Natural language processing
+- Operating system
+- Operations research
+- Parallel computing
+- Process engineering
+- Programming language
+- Real-time computing
+- Reliability engineering
+- Remote sensing
+- Risk analysis (engineering)
+- Simulation
+- Software engineering
+- Speech recognition
+- Systems engineering
+- Telecommunications
+- Theoretical computer science
+- Transport engineering
+- World Wide Web
+
+### Economics (17 fields)
+- Classical economics
+- Demographic economics
+- Econometrics
+- Economic policy
+- Economic system
+- Financial economics
+- International economics
+- Keynesian economics
+- Labour economics
+- Macroeconomics
+- Market economy
+- Mathematical economics
+- Microeconomics
+- Monetary economics
+- Neoclassical economics
+- Public economics
+- Welfare economics
+
+### Engineering (6 fields)
+- Aeronautics
+- Architectural engineering
+- Civil engineering
+- Construction engineering
+- Forensic engineering
+- Marine engineering
+
+### Environmental science (11 fields)
+- Agricultural engineering
+- Atmospheric sciences
+- Climatology
+- Environmental chemistry
+- Environmental engineering
+- Environmental protection
+- Meteorology
+- Petroleum engineering
+- Soil science
+- Waste management
+- Water resource management
+
+### Geography (9 fields)
+- Agroforestry
+- Archaeology
+- Cartography
+- Economic geography
+- Environmental resource management
+- Fishery
+- Forestry
+- Regional science
+- Socioeconomics
+
+### Geology (12 fields)
+- Earth science
+- Geochemistry
+- Geodesy
+- Geomorphology
+- Geotechnical engineering
+- Mineralogy
+- Mining engineering
+- Oceanography
+- Paleontology
+- Petrology
+- Physical geography
+- Seismology
+
+### History (4 fields)
+- Ancient history
+- Classics
+- Ethnology
+- Genealogy
+
+### Materials science (13 fields)
+- Biomedical engineering
+- Chemical engineering
+- Chemical physics
+- Composite material
+- Condensed matter physics
+- Engineering physics
+- Metallurgy
+- Nanotechnology
+- Nuclear engineering
+- Optics
+- Optoelectronics
+- Polymer science
+- Structural engineering
+
+### Mathematics (7 fields)
+- Applied mathematics
+- Combinatorics
+- Discrete mathematics
+- Geometry
+- Mathematical analysis
+- Pure mathematics
+- Statistics
+
+### Medicine (41 fields)
+- Anatomy
+- Anesthesia
+- Animal science
+- Bioinformatics
+- Cardiology
+- Demography
+- Dentistry
+- Dermatology
+- Emergency medicine
+- Environmental health
+- Family medicine
+- Gastroenterology
+- General surgery
+- Gerontology
+- Gynecology
+- Immunology
+- Intensive care medicine
+- Internal medicine
+- Library science
+- Medical education
+- Medical emergency
+- Medical physics
+- Nuclear medicine
+- Nursing
+- Obstetrics
+- Oncology
+- Operations management
+- Ophthalmology
+- Optometry
+- Orthodontics
+- Pathology
+- Pediatrics
+- Pharmacology
+- Physical medicine and rehabilitation
+- Physical therapy
+- Physiology
+- Psychiatry
+- Radiology
+- Surgery
+- Traditional medicine
+- Urology
+
+### Philosophy (1 field)
+- Theology
+
+### Physics (16 fields)
+- Aerospace engineering
+- Astrobiology
+- Astronomy
+- Astrophysics
+- Atomic physics
+- Classical mechanics
+- Computational physics
+- Geophysics
+- Mathematical physics
+- Mechanics
+- Nuclear physics
+- Particle physics
+- Quantum electrodynamics
+- Quantum mechanics
+- Statistical physics
+- Theoretical physics
+
+### Political science (9 fields)
+- Development economics
+- Economic growth
+- Economic history
+- Economy
+- Law
+- Law and economics
+- Political economy
+- Public administration
+- Public relations
+
+### Psychology (14 fields)
+- Applied psychology
+- Audiology
+- Clinical psychology
+- Cognitive psychology
+- Cognitive science
+- Communication
+- Criminology
+- Developmental psychology
+- Linguistics
+- Mathematics education
+- Neuroscience
+- Psychoanalysis
+- Psychotherapist
+- Social psychology
+
+### Sociology (12 fields)
+- Aesthetics
+- Anthropology
+- Engineering ethics
+- Environmental ethics
+- Epistemology
+- Gender studies
+- Management
+- Media studies
+- Pedagogy
+- Positive economics
+- Religious studies
+- Social science
+
+---
+
+## RENDER INTEGRITY ANALYSIS (2026-02-06/07, updated Feb 7 night)
+
+### Overview
+Built and ran a frame integrity checker across ~130,000 frames of the final 8K seamless loop render, split across four external drives. Found both isolated corruptions and a systematic camera flip in backward renders. Camera was fixed and corrected renders are in progress.
+
+### Drive Layout & Frame Inventory (as of Feb 7 ~23:30)
+
+| Drive | Direction | Frame Range | JPGs | EXRs | Status |
+|-------|-----------|-------------|------|------|--------|
+| Mo 4TB | Forward | 50063→65803 | ~15,741 | ~15,741 | Complete |
+| Mo 4TB 2 | Forward | 4→50062 | 50,059 | 50,059 | Complete |
+| Mo 4TB 3 | Backward | 22,666→66,000 | 22,535 | 20,717 | Active rendering (4 frontiers) |
+| Mo 4TB 4 | Backward | 4→22,664 | 22,661 | 22,661 | Complete (step-1) |
+
+**Forward pass**: Complete. ~65,800 frames total across Drives 1+2.
+**Backward pass**: Drive 4 complete at step-1. Drive 3 actively rendering with 4 step-1 frontiers.
+
+### Frame Integrity Checker
+
+**Script**: `/Users/mo/github/ucl_eye/frame_integrity_check/check_frames.py`
+**Environment**: `/opt/anaconda3/envs/pytorch/` (numpy, Pillow, scipy, matplotlib)
+**Results**: `/Users/mo/github/ucl_eye/frame_integrity_check/results/` (gitignored)
+
+**Methodology**:
+- Compares adjacent frames using multiple metrics
+- Downscale factor 16 (8K → ~500px) — sufficient for corruption detection
+- Metrics: Mean Absolute Difference (MAD), max block difference, histogram chi-squared, correlation coefficient, dark pixel ratio, brightness, standard deviation
+- Anomaly detection: Median + MAD-based robust statistics (scaled by 1.4826), 5-sigma threshold
+- Throttled mode (1 worker, 0.05s sleep) to avoid interfering with active renders
+
+**Usage**:
+```bash
+# Scan specific range
+/opt/anaconda3/envs/pytorch/bin/python check_frames.py \
+  /Volumes/Mo\ 4TB\ 2/render/16_final_path_fw_no_hero \
+  --range 4 50062 --throttle 0.05 --workers 1
+
+# Scan all known ranges
+/opt/anaconda3/envs/pytorch/bin/python check_frames.py --scan-all --throttle 0.05
+```
+
+### Finding 1: Wrong Camera in Backward Render (CRITICAL — CAMERA FIXED, RE-RENDERING)
+
+The backward render on Drive 3 had the **forward camera active** for a large batch of step-2 and some step-1 fills. These frames were pixel-identical to the forward render.
+
+**Detection methods developed (in order of reliability)**:
+1. **oiiotool --diff pixel comparison** (definitive): Compare BW frame against FW at same frame number. RMS < 0.01 = identical = wrong camera. RMS ~0.36-0.46 = correct (different orbit positions).
+2. **Pixel correlation**: Wrong-camera frames have corr > 0.99. Correct frames corr ~0.1-0.3.
+3. **File size comparison**: Step-2 fills rendered with wrong camera are larger (~71-78 MB EXR) vs correct BW step-4 frames (~37-47 MB). Only catches ~40% of cases.
+4. **mtime analysis**: JPG-EXR mtime difference of 0.1-0.3s indicates simultaneous write (same render pass).
+
+**Flip boundary**: Frame 31024 (last correct step-2) → 31026 (first flipped step-2). All step-2 fills from 31026-65998 were flipped.
+
+**Wrong-camera frames found: ~9,183 total**
+
+| Step | Range | Count | Notes |
+|------|-------|-------|-------|
+| Step-2 | 31026 → 65998 | 8,744 | Contiguous block |
+| Step-1 | 22665 → 22669 | 3 | Isolated boundary |
+| Step-1 | 25711 → 25861 | 76 | Contiguous block |
+| Step-1 | 30005 → 30231 | 114 | Render frontier |
+| Step-1 | 32557 → 32737 | 91 | Render frontier |
+| Step-1 | 36901 → 36985 | 43 | Render frontier |
+| Step-1 | 40005 → 40231 | 114 | Render frontier |
+| Step-2 | 22670 | 1 | Isolated straggler |
+
+**Deletion details**: A previous agent deleted both JPG and EXR for flipped frames in most cases. The deletion was verified by checking untouched ranges (e.g., frames 45002-45046 between frontiers): these step-2 fills have NEITHER JPG nor EXR, confirming both were deleted.
+
+**Blender skip/overwrite behavior** (confirmed via mtime and pixel analysis):
+- Blender checks for **JPG** to decide whether to skip a frame
+- Missing JPG → Blender renders the frame and writes both JPG and EXR
+- Present JPG → Blender skips entirely (does not re-render)
+- When re-rendering, Blender DOES overwrite existing EXR files
+
+**Camera was fixed** and all four active render frontiers confirmed rendering with correct backward camera.
+
+**What we initially thought was "cache degradation"** (step-4 BW frames appearing dim at 32K-66K) is actually the **legitimate backward camera view** — the backward orbit passes through a region with fewer visible particles, so lower brightness is expected. Step-2 fills appeared "brighter" only because they were secretly forward-camera frames.
+
+### Finding 2: Corrected Renders Missing EXR for Step-2 Fills (NEW — Feb 7)
+
+The corrected step-1 renders write JPGs for ALL frames they encounter, but **do NOT write EXR for step-2 fill frames**. Odd (step-1) frames get both JPG and EXR.
+
+**Evidence** (frames 31025-31035, all rendered ~9.3h ago by corrected renders):
+- 31025 (odd): JPG + EXR (101.5 MB) ✓
+- 31026 (step-2): JPG only, NO EXR ✗
+- 31027 (odd): JPG + EXR (101.5 MB) ✓
+- 31028 (step-4): JPG + EXR (101.4 MB, from original 91h ago) ✓
+- 31029 (odd): JPG + EXR (101.5 MB) ✓
+- 31030 (step-2): JPG only, NO EXR ✗
+
+**Scope**: 1,722 step-2 fill frames on Drive 3 have JPG but no EXR.
+
+**Hypothesis**: The batch rendering script configuration may not include the EXR compositor output node for re-renders, or there's a file output node configuration issue in Blender.
+
+**Impact**: After all JPG rendering completes, a second pass will be needed to generate EXRs for these ~1,722 frames (plus any additional step-2 fills re-rendered by the current frontiers going forward). Alternatively, fix the render configuration to produce EXR and re-render just these frames.
+
+### Finding 3: Isolated Corrupted Frames (7 total, NOT deleted)
+
+Individual frames with correct camera but wrong render output (batch boundary glitches):
+
+| Frame | Drive | Direction | Issue | Brightness vs Expected |
+|-------|-------|-----------|-------|----------------------|
+| 2697 | Mo 4TB 4 | BW | Too bright | 65 vs ~40 |
+| 23270 | Mo 4TB 3 | BW | Too dim | ~18 vs ~30 |
+| 25005 | Mo 4TB 3 | BW | Corrupted | Statistical anomaly |
+| 25707 | Mo 4TB 3 | BW | Too dim | 24.6 vs 32.0 |
+| 55680 | Mo 4TB 3 | BW | Too bright | 20.7 vs 8.5 (step-4 batch boundary) |
+| 23430 | Mo 4TB 2 | FW | Too bright | Missing shadows/AO |
+| 24970 | Mo 4TB 2 | FW | Too bright | Missing shadows/AO |
+
+**These still exist on disk** and need individual re-rendering.
+
+### Finding 4: Forward Renders Clean
+
+Both forward drives confirmed consistent and correct:
+- Drive 1 FW (50063→65803): No anomalies
+- Drive 2 FW (4→50062): 2 isolated corruptions (23430, 24970) only
+
+### Finding 5: No Non-Sequential Rendering Artifacts
+
+Comprehensive artifact analysis across all regions found:
+- **No brightness flicker** between step types: step-4, step-2, step-1 match within 0.03 brightness
+- **No step-boundary correlation drops** (except natural scene dynamics in high-motion regions)
+- **D3/D4 drive boundary**: Clean transition, no discontinuity
+- The step-4 BW brightness profile (dim at 40K-60K) is the genuine backward camera view
+
+### Active Render Status (Feb 8 ~00:10)
+
+4 concurrent Blender processes rendering step-1, advancing forward on Drive 3:
+
+| Frontier | Current Frame | Advancing Toward |
+|----------|--------------|-----------------|
+| 1 | ~29,787 | → 66,000 |
+| 2 | ~33,389 | → 66,000 |
+| 3 | ~43,367 | → 66,000 |
+| 4 | ~53,151 | → 66,000 |
+
+**Speed**: ~585-749 frames/hr (4 concurrent, step-1, batch size 64)
+
+### Exhaustive Wrong-Camera Re-check (Feb 8 ~00:00, DEFINITIVE)
+
+Checked ALL remaining step-2 frames in the 31026-65998 danger zone and ALL step-1 frames in original wrong ranges on D3 using /32 pixel correlation:
+
+| Check | Frames Checked | Wrong Found | Notes |
+|-------|---------------|-------------|-------|
+| Step-2 in 31026-65998 | 1,785 | 2 (false positives) | 32770, 32774 — within 2 frames of meeting point 32772 |
+| Step-1 in original wrong ranges | 91 | 0 | All correct |
+| Frame 33182 (flagged by other agent) | 1 | 0 | corr=0.497 — correct backward camera |
+
+**Frames 32770 and 32774**: Almost certainly false positives. At 2 frames from the meeting point (32772), the FW and BW cameras are only 0.011° apart. Their correlation of 0.997 is far below the definitive wrong-camera threshold (0.99998+). However, the auto-delete script removed their JPGs. Blender will re-render them when a frontier passes. No harm done.
+
+**Frame 33182**: CONFIRMED CORRECT. The other agent's concern was unfounded — this frame was already re-rendered with the correct backward camera before frontier 2 passed it.
+
+**VERDICT: Zero wrong-camera frames remain on disk.** The original 9,183 deletion plus frame 22670 straggler was sufficient.
+
+### Gap Analysis (Feb 8 ~00:10)
+
+**Gaps BEHIND all frontiers (will NOT be covered by current renders):**
+
+| Frames | Count | Issue |
+|--------|-------|-------|
+| 22,667, 22,669 | 2 | Odd frames at D3/D4 boundary, deleted wrong-camera |
+| 22,670 | 1 | Even (step-2) at boundary, deleted wrong-camera |
+| 25,711-25,861 | 76 | Contiguous odd block, deleted wrong-camera |
+| **Total** | **79** | Need separate render |
+
+**Gaps AHEAD of frontiers (will be covered as renders advance):**
+
+| Type | Approx Count | Notes |
+|------|-------------|-------|
+| Deleted step-2 fills (31026→65998) | ~6,961 | Both JPG+EXR deleted, re-rendered when frontier passes |
+| 32770, 32774 | 2 | JPGs deleted by false-positive check, re-rendered when frontier passes |
+| Missing odd frames | ~12,000+ | Never rendered yet, created when frontier passes |
+| **Total** | ~19,000+ | Covered by current 4 frontiers advancing to 66,000 |
+
+**Frame list saved to**: `/Users/mo/github/ucl_eye/frame_integrity_check/wrong_camera_frames.json`
+
+### Lessons Learned
+
+1. **Always verify camera selection before batch renders**: The backward render silently used the forward camera for step-2/step-1 fills. Cross-reference a sample against the other pass immediately.
+2. **oiiotool --diff is the definitive wrong-camera test**: `oiiotool --diff frame_bw.exr frame_fw.exr` → RMS < 0.01 means identical (wrong camera). File size comparison only catches ~40%.
+3. **Don't assume "degradation" without cross-checking**: What looked like progressive cache fade-to-black was actually the correct backward view — the "bright" step-2 fills were the wrong camera.
+4. **Blender skip logic checks JPG, not EXR**: Delete only the JPG to force re-render. Both JPG and EXR get rewritten.
+5. **Check BOTH JPG and EXR when verifying deletions**: A previous agent deleted JPGs but missed EXRs for some frames. Always verify both file types.
+6. **Throttle I/O during active renders**: Use `--throttle 0.05 --workers 1`.
+7. **macOS `._` files**: Filter with `not name.startswith('.')`.
+8. **Verify EXR output after re-renders**: The corrected step-1 renders wrote JPGs but missed EXRs for step-2 fill frames. Always check both outputs after a re-render pass.
+
+---
+
+## COMPLETED: MOLECULAR PLUS BATCHED RENDERING
+
+### The Problem
+Blender's Molecular Plus plugin leaks memory during long command-line renders, eventually causing crashes or degraded output.
+
+### Solution
+`simulate.py` was modified to add `--batch-size N` CLI argument that:
+1. Renders N frames at a time
+2. Saves to disk cache
+3. Restarts Blender between batches
+4. Wrapper shell script orchestrates the batch loop
+
+### Memory Formula
+For Molecular Plus simulations:
+```
+Memory ≈ N_particles × N_cached_frames × 200 bytes
+```
+At 370K particles × 65536 frames × 200 bytes ≈ 4.5 TB (impossible to cache fully)
+→ Must use disk cache + shorter batch windows
+
+---
+
+## EXR SCANLINE CORRUPTION (Feb 9-10, ACTIVE)
+
+### The Problem
+DaVinci Resolve "media offline" errors at specific timecodes during export. JPG proxies look fine — corruption is **EXR-only** (corrupted/missing scanline chunks). The JPG-based `check_frames.py` scanner cannot detect this.
+
+### Detection Method
+1. **DaVinci Resolve export**: Fails at specific timecodes with "media offline"
+2. **Timecode → frame mapping**: TC (MM:SS:FF at 60fps) → symlink index → actual frame number
+   - If DaVinci shows HH:MM:SS:FF with leading `01:`, subtract 1 hour first
+   - Index = `(MM * 60 + SS) * 60 + FF`
+   - Symlink dir: `/Volumes/Mo 4TB/render/seamless_loop_step1_EXR_100pct/`
+   - Frame offset: symlink index + 4 (due to offset in symlink generator)
+3. **oiiotool confirmation** (DEFINITIVE): `oiiotool frame.exr --printstats`
+   - Corrupt: `"unable to compute: Some scanline chunks were missing or corrupted"`
+   - Clean: prints stats without error
+   - Takes ~2 sec per 8K 14-channel EXR
+4. **Always check adjacent frames** (corruption sometimes spans 2+ consecutive frames)
+
+### Scan Script
+`/tmp/exr_scan.py` — parallel oiiotool --printstats across all EXRs, 3 workers per drive. At ~2 sec/frame with 3 workers, D1 (15K EXRs) takes ~2.5 hours. Full 130K scan ~18 hours.
+
+### Key Insights
+1. JPG and EXR are written by separate Blender output nodes. EXR corruption does NOT affect the JPG — the JPG can look pixel-perfect while the EXR has corrupted scanline chunks. This is likely a write-time I/O issue (disk contention during concurrent renders).
+2. **DaVinci does NOT always catch corruption.** Sometimes DaVinci silently renders a corrupt/missing frame instead of showing "media offline". This means DaVinci export alone is NOT sufficient — **exhaustive oiiotool scan of every EXR is mandatory**.
+3. Corruption on D3 BW is widespread (80+ frames across 23K-64K range) and often appears in clusters spaced exactly 4 frames apart (step-2 pattern), suggesting batch-boundary corruption during original renders.
+
+### Deletion Protocol
+When confirmed corrupt: delete BOTH JPG and EXR. Blender checks for JPG to decide skip/render, so deleting JPG forces re-render of both.
+
+### Corrupt Frames Found (cumulative, Feb 10)
+
+**D2 FW (Mo 4TB 2) — ALL CLEAN:**
+| Frame | TC | Found by | Status |
+|-------|----|----------|--------|
+| 32772 | 06:34:43 | DaVinci | Re-rendered, verified |
+| 23687 | — | DaVinci | Re-rendered, verified |
+| 24964 | — | DaVinci | Re-rendered, verified |
+| 43908 | 12:11:44 | DaVinci | Re-rendered, verified |
+| 48132 | 13:22:08 | DaVinci | Re-rendered, verified |
+
+**D1 FW (Mo 4TB) — ALL CLEAN:**
+| Frame | TC | Found by | Status |
+|-------|----|----------|--------|
+| 51076 | 14:11:12 | DaVinci | Re-rendered, verified |
+| 51077 | 14:11:13 | Adjacent check | Re-rendered, verified |
+| 53764 | 14:56:00 | DaVinci | Re-rendered, verified |
+| 59012 | 16:23:28 | DaVinci | Re-rendered, verified |
+| 59652 | 16:34:08 | DaVinci | Re-rendered, verified |
+
+**D1 FW exhaustive scan: 14,723 EXRs checked, 0 corrupt. D1 CLEAN.**
+
+**D3 BW (Mo 4TB 3) — AWAITING RE-RENDER:**
+
+Frames found via DaVinci TC + adjacent checks (JPG+EXR already deleted):
+36245, 36246, 36269, 37765, 37766, 37767, 37794, 37801, 37802,
+47327, 47407, 47540, 47637, 47639, 48553, 48555, 48602, 48605,
+48615, 48618, 48943, 49719, 49730, 49777, 56660, 59183, 59187,
+59191, 59668, 59934, 59938, 60379, 60383, 60387, 60391, 60742,
+60944, 61478, 61482, 61486, 61490, 61861, 61865, 62031, 62035,
+62245, 62375, 62379, 63382, 63386, 64024
+**(51 frames, range 36245→64024)**
+
+Frames found by background oiiotool scan (EXR still on disk, JPG needs deletion before render):
+23146, 23266, 23274, 23393, 23450, 23489, 23493, 23894, 23902,
+23938, 23958, 24161, 24165, 24450, 24501, 24510, 24514, 24518,
+24522, 24547, 24551, 24653, 24657, 24658, 25001, 25053, 25154,
+25341, 25435, 25439, 25555, 25612, 25690, 25694
+**(34+ frames so far, scan only 8% complete on D3)**
+
+**D3 BW + D4 BW (35676):**
+| Frame | Found by | Status |
+|-------|----------|--------|
+| 35676 | DaVinci | Re-rendered, verified |
+
+### Observations
+- **D3 BW has the vast majority of corruption** — 85+ frames found so far
+- D1 FW and D2 FW are now fully clean after re-renders
+- Corruption often comes in pairs/clusters spaced 4 frames apart (step-2 batch boundaries)
+- Sometimes 3+ consecutive frames corrupt (37765-37767)
+- Corruption spans entire D3 range (23K-64K) — not localized
+
+### Completed Scans (Feb 10)
+- **D1 FW**: 14,723 EXRs, 0 scanline corrupt. 4 anomaly-flagged, PENDING re-render.
+- **D2 FW**: 50,059 EXRs, 0 scanline corrupt. 46 anomaly-flagged, PENDING re-render.
+- **D3 BW**: ~43K EXRs, 34 scanline corrupt (all re-rendered). 72 anomaly-flagged → re-rendered → 3 genuine corrupt FIXED.
+- **D4 BW**: 22,650 EXRs, 0 scanline corrupt. 30 anomaly-flagged → re-rendered → 2 genuine corrupt FIXED.
+
+### NAS Archive
+Old originals from anomaly re-renders archived to:
+`/Volumes/Datasets Toshibas/ucl_eye/render_soft_launch/`
+- `D4_BW_staging_anomaly/` — 30 JPG + 30 EXR (SHA256 verified)
+- `D3_BW_staging_anomaly/` — 72 JPG + 72 EXR (SHA256 verified)
+- `copy_manifest.json` — full SHA256 checksums
+
+---
+
 ## NEXT STEPS
 
+### Immediate (Feb 10 evening)
+1. **Stage D2 FW** (46 frames, forward camera) — biggest remaining batch
+2. **Stage D1 FW** (4 frames, forward camera) — can do same Blender session as D2
+3. Re-render both, compare old vs new, identify genuine corruption
+4. Archive old originals to NAS, delete staging from DAS
+5. Regenerate symlink sequences: `python3 symlink_sequence.py --step 1`
+6. Final DaVinci export
+
+### Barnes-Hut Gravity (On Hold)
 After completing Barnes-Hut gravity:
 1. Test with simple 2-body system (verify orbital mechanics)
 2. Test with multi-body galaxy simulation
