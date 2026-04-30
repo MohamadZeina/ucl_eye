@@ -46,11 +46,12 @@ LOG_FILE = "/Users/mo/github/ucl_eye/frame_integrity_check/results/render17_moni
 POLL_INTERVAL = 30          # seconds between scans
 DOWNSCALE = 8               # 8K → 1K for JPG pixel analysis
 CLUSTER_GAP = 100           # frame gap > this = new render frontier
+FRONTIER_MARGIN = 5         # skip last N frames at each frontier tip (being written)
 
 # Coarse thresholds
 JPG_SIZE_THRESH = 0.10      # 10% JPG size deviation (JPGs vary more than EXR)
-EXR_SIZE_THRESH = 0.02      # 2% EXR size deviation
-EXR_MIN_SIZE_MB = 50        # EXR below this is suspect (512s ~65 MB)
+EXR_SIZE_THRESH = 0.05      # 5% EXR size deviation (frame sizes vary by orbit position)
+EXR_MIN_SIZE_MB = 10        # only catch truly broken EXRs (sizes range 27-65MB by region)
 JPG_MIN_SIZE_KB = 500       # JPG below this is suspect
 
 # Sensitive thresholds (pixel-level, 512 samples = tight)
@@ -135,6 +136,41 @@ def exr_stats(filepath):
         return None, None, True
 
 
+def exr_pair_diff(path_a, path_b):
+    """Diff two EXR files on Composite RGB channels via oiiotool.
+    Returns dict with mean_error, rms_error, peak_snr, max_error or None on failure."""
+    try:
+        r = subprocess.run(
+            ['oiiotool',
+             path_a, '--ch', 'Composite.R,Composite.G,Composite.B',
+             path_b, '--ch', 'Composite.R,Composite.G,Composite.B',
+             '--diff'],
+            capture_output=True, text=True, timeout=60
+        )
+        output = r.stdout + r.stderr
+        result = {}
+        for line in output.split('\n'):
+            if 'Mean error' in line:
+                m = re.search(r'Mean error\s*=\s*([\d.eE+\-]+)', line)
+                if m:
+                    result['mean_error'] = float(m.group(1))
+            elif 'RMS error' in line:
+                m = re.search(r'RMS error\s*=\s*([\d.eE+\-]+)', line)
+                if m:
+                    result['rms_error'] = float(m.group(1))
+            elif 'Peak SNR' in line:
+                m = re.search(r'Peak SNR\s*=\s*([\d.eE+\-]+)', line)
+                if m:
+                    result['peak_snr'] = float(m.group(1))
+            elif 'Max error' in line:
+                m = re.search(r'Max error\s*=\s*([\d.eE+\-]+)', line)
+                if m:
+                    result['max_error'] = float(m.group(1))
+        return result if result else None
+    except Exception:
+        return None
+
+
 def detect_clusters(frame_nums):
     """Group frame numbers into render frontier clusters."""
     if not frame_nums:
@@ -147,6 +183,17 @@ def detect_clusters(frame_nums):
         else:
             clusters[-1].append(sorted_nums[i])
     return clusters
+
+
+def frontier_tip_frames(frame_nums):
+    """Return set of frame numbers at frontier tips (last FRONTIER_MARGIN per cluster).
+    These are actively being written by Blender and should be skipped."""
+    clusters = detect_clusters(frame_nums)
+    tips = set()
+    for c in clusters:
+        for f in c[-FRONTIER_MARGIN:]:
+            tips.add(f)
+    return tips
 
 
 def find_cluster_neighbors(frame_num, frame_data, all_sorted, window=WINDOW):
@@ -196,8 +243,10 @@ def prev_frame_in_cluster(frame_num, all_sorted):
 
 checked_jpg = set()
 checked_exr = set()
+diffed_exr = set()     # EXR pairs already diffed
 frame_data = {}        # frame_num -> {jpg_size, exr_size, jpg_stats, exr_avg, ...}
 pair_metrics = {}      # frame_num -> {mad, max_block_diff, correlation, ...}
+exr_diff_metrics = {}  # frame_num -> {mean_error, rms_error, peak_snr, max_error}
 anomalies = []
 stats = {"checked": 0, "clean": 0, "flagged": 0}
 
@@ -206,27 +255,35 @@ mad_history = []
 block_history = []
 corr_history = []
 brightness_history = []
+exr_rms_history = []
+exr_maxerr_history = []
 
 
 def load_state():
-    global checked_jpg, checked_exr, frame_data, pair_metrics, anomalies, stats
+    global checked_jpg, checked_exr, diffed_exr, frame_data, pair_metrics, exr_diff_metrics
+    global anomalies, stats
     global mad_history, block_history, corr_history, brightness_history
+    global exr_rms_history, exr_maxerr_history
     if os.path.exists(LOG_FILE):
         try:
             with open(LOG_FILE) as f:
                 prev = json.load(f)
             checked_jpg = set(prev.get('checked_jpg', []))
             checked_exr = set(prev.get('checked_exr', []))
+            diffed_exr = set(prev.get('diffed_exr', []))
             frame_data = {int(k): v for k, v in prev.get('frame_data', {}).items()}
             pair_metrics = {int(k): v for k, v in prev.get('pair_metrics', {}).items()}
+            exr_diff_metrics = {int(k): v for k, v in prev.get('exr_diff_metrics', {}).items()}
             anomalies = prev.get('anomalies', [])
             stats = prev.get('stats', stats)
             mad_history = prev.get('mad_history', [])
             block_history = prev.get('block_history', [])
             corr_history = prev.get('corr_history', [])
             brightness_history = prev.get('brightness_history', [])
+            exr_rms_history = prev.get('exr_rms_history', [])
+            exr_maxerr_history = prev.get('exr_maxerr_history', [])
             print(f"Resumed: {len(checked_jpg)} JPG + {len(checked_exr)} EXR checked, "
-                  f"{len(anomalies)} anomalies", flush=True)
+                  f"{len(diffed_exr)} EXR diffed, {len(anomalies)} anomalies", flush=True)
         except Exception as e:
             print(f"Could not load state: {e}", flush=True)
 
@@ -236,6 +293,7 @@ def save_state():
     # Keep recent frame_data to limit file size
     recent = dict(sorted(frame_data.items())[-3000:])
     recent_pairs = dict(sorted(pair_metrics.items())[-3000:])
+    recent_exr_diffs = dict(sorted(exr_diff_metrics.items())[-3000:])
     with open(LOG_FILE, 'w') as f:
         json.dump({
             'last_updated': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -245,12 +303,16 @@ def save_state():
             'anomalies': anomalies,
             'checked_jpg': sorted(checked_jpg)[-5000:],
             'checked_exr': sorted(checked_exr)[-5000:],
+            'diffed_exr': sorted(diffed_exr)[-5000:],
             'frame_data': {str(k): v for k, v in recent.items()},
             'pair_metrics': {str(k): v for k, v in recent_pairs.items()},
+            'exr_diff_metrics': {str(k): v for k, v in recent_exr_diffs.items()},
             'mad_history': mad_history[-500:],
             'block_history': block_history[-500:],
             'corr_history': corr_history[-500:],
             'brightness_history': brightness_history[-500:],
+            'exr_rms_history': exr_rms_history[-500:],
+            'exr_maxerr_history': exr_maxerr_history[-500:],
         }, f, indent=2)
 
 
@@ -291,11 +353,14 @@ def scan_cycle():
     all_frames = sorted(set(jpg_files.keys()) | set(exr_files.keys()))
     all_checked_data = sorted(frame_data.keys())
 
+    # Identify frontier tips — skip these (actively being written by Blender)
+    tips = frontier_tip_frames(all_frames)
+
     new_checks = 0
     new_flags = 0
 
     # ── 1. Check new JPGs ────────────────────────────────────────────────
-    new_jpgs = sorted(n for n in jpg_files if n not in checked_jpg)
+    new_jpgs = sorted(n for n in jpg_files if n not in checked_jpg and n not in tips)
     if new_jpgs:
         remaining = len(new_jpgs)
         new_jpgs = new_jpgs[:MAX_PER_CYCLE]
@@ -419,7 +484,7 @@ def scan_cycle():
         stats['checked'] += 1
 
     # ── 2. Check new EXRs ────────────────────────────────────────────────
-    new_exrs = sorted(n for n in exr_files if n not in checked_exr)
+    new_exrs = sorted(n for n in exr_files if n not in checked_exr and n not in tips)
     if new_exrs:
         remaining = len(new_exrs)
         new_exrs = new_exrs[:MAX_PER_CYCLE]
@@ -443,7 +508,7 @@ def scan_cycle():
         if sz == 0:
             issues.append("ZERO_SIZE_EXR")
         elif sz_mb < EXR_MIN_SIZE_MB:
-            issues.append(f"small_exr={sz_mb:.1f}MB (expected ~65MB)")
+            issues.append(f"small_exr={sz_mb:.1f}MB (min={EXR_MIN_SIZE_MB}MB)")
 
         neighbors = find_cluster_neighbors(num, frame_data, all_checked_data)
         if len(neighbors) >= 3:
@@ -512,7 +577,68 @@ def scan_cycle():
 
         stats['checked'] += 1
 
-    # ── 3. Cross-check: missing pairs ────────────────────────────────────
+    # ── 3. EXR pair diff (pixel-level on Composite RGB) ─────────────────
+    # Diff consecutive EXR pairs within the same cluster
+    MAX_DIFFS_PER_CYCLE = 20  # ~2s each, so ~40s max per cycle
+    exr_sorted = sorted(exr_files.keys())
+    new_diffs = 0
+    for i in range(1, len(exr_sorted)):
+        if new_diffs >= MAX_DIFFS_PER_CYCLE:
+            break
+        num = exr_sorted[i]
+        prev = exr_sorted[i - 1]
+        # Skip frontier tips
+        if num in tips or prev in tips:
+            continue
+        # Skip if already diffed or cross-cluster
+        if num in diffed_exr:
+            continue
+        if num - prev > CLUSTER_GAP:
+            continue
+        # Both must be non-zero and old enough
+        try:
+            sz_a = os.path.getsize(exr_files[prev])
+            sz_b = os.path.getsize(exr_files[num])
+            mt_b = os.path.getmtime(exr_files[num])
+        except:
+            continue
+        if sz_a == 0 or sz_b == 0 or time.time() - mt_b < 10:
+            continue
+
+        diff = exr_pair_diff(exr_files[prev], exr_files[num])
+        diffed_exr.add(num)
+        new_diffs += 1
+
+        if diff:
+            exr_diff_metrics[num] = diff
+            if 'rms_error' in diff:
+                exr_rms_history.append(diff['rms_error'])
+            if 'max_error' in diff:
+                exr_maxerr_history.append(diff['max_error'])
+
+            issues = []
+            # Z-score on RMS error
+            if 'rms_error' in diff and len(exr_rms_history) >= 30:
+                z_rms = robust_z(diff['rms_error'], exr_rms_history)
+                if z_rms > PIXEL_SIGMA:
+                    issues.append(f"exr_high_rms z={z_rms:.1f} (val={diff['rms_error']:.4f})")
+            # Z-score on max error
+            if 'max_error' in diff and len(exr_maxerr_history) >= 30:
+                z_max = robust_z(diff['max_error'], exr_maxerr_history)
+                if z_max > PIXEL_SIGMA:
+                    issues.append(f"exr_high_maxerr z={z_max:.1f} (val={diff['max_error']:.2f})")
+
+            if issues:
+                anomalies.append({
+                    'frame': num, 'source': 'exr_diff',
+                    'severity': 'MEDIUM', 'issues': issues,
+                    'time': time.strftime('%H:%M:%S'),
+                })
+                stats['flagged'] += 1
+                new_flags += 1
+                print(f"  ** EXR-DIFF {num} [MEDIUM]: {'; '.join(issues)}", flush=True)
+
+    # ── 4. Cross-check: missing pairs ────────────────────────────────────
     # Only check frames that have been fully checked on at least one side
     # and are old enough that both should exist
     for num in sorted(checked_jpg & checked_exr):
@@ -536,14 +662,14 @@ def scan_cycle():
                 print(f"  ** FRAME {num}: JPG exists but no EXR (neighbors have EXRs)", flush=True)
                 new_flags += 1
 
-    # ── 4. Report clusters ───────────────────────────────────────────────
+    # ── 5. Report clusters ───────────────────────────────────────────────
     if new_checks > 0:
         clusters = detect_clusters(sorted(jpg_files.keys()))
         cluster_info = []
         for c in clusters:
             cluster_info.append(f"{c[0]}..{c[-1]} ({len(c)})")
-        print(f"[{time.strftime('%H:%M:%S')}] +{new_checks} checked ({new_flags} flagged) | "
-              f"Total: {stats['checked']} checked, {stats['flagged']} flagged | "
+        print(f"[{time.strftime('%H:%M:%S')}] +{new_checks} checked, +{new_diffs} EXR-diffed ({new_flags} flagged) | "
+              f"Total: {stats['checked']} checked, {len(diffed_exr)} EXR-diffed, {stats['flagged']} flagged | "
               f"JPGs: {len(jpg_files)}, EXRs: {len(exr_files)} | "
               f"Frontiers: {', '.join(cluster_info)}", flush=True)
         save_state()
