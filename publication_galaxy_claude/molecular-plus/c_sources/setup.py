@@ -80,12 +80,12 @@ if not DEBUG_MODE:
                 ["molecular_core/core.pyx"],
                 extra_compile_args=[
                     "-O3",
-                    "-mavx2",
+                    "-march=x86-64-v3",  # Enables AVX2 + FMA + BMI1/2 (much faster than -mavx2 alone)
                     "-ffast-math",
                     "-fno-builtin",
                     "-fopenmp",
                 ],
-                extra_link_args=["-lm", "-fopenmp"],
+                extra_link_args=["-lm", "-fopenmp", "-Wl,--disable-new-dtags"],  # Avoid RPATH issues
             )
         ]
     elif os_name == "Darwin":
